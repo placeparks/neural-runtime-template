@@ -5,7 +5,7 @@ mkdir -p "$HOME/.neuralclaw" "$HOME/.neuralclaw/data" "$HOME/.neuralclaw/logs"
 
 # Install NeuralClaw and channel adapters at container boot.
 # Pin major/minor if you want deterministic upgrades.
-pip install "neuralclaw[all-channels]"
+pip install "neuralclaw[all-channels]" "aiohttp"
 
 AGENT_NAME="${NEURALCLAW_AGENT_NAME:-NeuralClaw}"
 PROVIDER="${NEURALCLAW_PROVIDER:-openai}"
@@ -93,4 +93,4 @@ fi
 
 # Railway sets PORT for web-facing services; NeuralClaw gateway has its own channel listeners.
 # This process is long-running.
-exec python -m neuralclaw.cli gateway
+exec python /app/mesh_gateway.py

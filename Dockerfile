@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY start.sh /app/start.sh
+COPY mesh_gateway.py /app/mesh_gateway.py
 RUN chmod +x /app/start.sh
 
 CMD ["/app/start.sh"]

@@ -22,6 +22,13 @@ Your provisioner should set these env vars per service:
   - `NEURALCLAW_SLACK_APP_API_KEY`
   - `NEURALCLAW_WHATSAPP_API_KEY`
   - `NEURALCLAW_SIGNAL_API_KEY`
+- Mesh/runtime flags:
+  - `NEURALCLAW_MESH_ENABLED` (`true|false`)
+  - `NEURALCLAW_MESH_PEERS_JSON` (JSON array of peer metadata)
+  - `NEURALCLAW_ENABLE_DASHBOARD` (`true|false`, optional)
+  - `NEURALCLAW_MESH_TIMEOUT_SECONDS` (delegation timeout, optional)
+  - `NEURALCLAW_MESH_PORT` (HTTP mesh port, default `PORT` or 8100)
+  - `NEURALCLAW_MESH_SHARED_SECRET` (optional shared secret for mesh requests)
 
 ## Deploy check (manual)
 
@@ -34,3 +41,6 @@ Your provisioner should set these env vars per service:
 - Uses `pip install "neuralclaw[all-channels]"` at startup.
 - Does not run `neuralclaw init` (interactive, not suitable for automation).
 - Stores runtime config in `$HOME/.neuralclaw/config.toml`.
+- Writes mesh peers to `$HOME/.neuralclaw/mesh-peers.json` when provided.
+- Uses `/app/mesh_gateway.py` to intercept `ask <agent> ...` and delegate over mesh HTTP.
+- Exposes `POST /a2a/message` for remote agents to send tasks.
