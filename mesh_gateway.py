@@ -21,7 +21,7 @@ logger = logging.getLogger("mesh_gateway")
 
 
 ASK_PATTERN = re.compile(
-    r"^\s*(?:ask|delegate(?:\s+to)?)\s+([a-zA-Z0-9_-]+)\s+(?:to\s+)?(.+?)\s*$",
+    r"^\s*(?:ask|delegate(?:\s+to)?)\s+(.+?)\s+to\s+(.+?)\s*$",
     re.IGNORECASE,
 )
 
