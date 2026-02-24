@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
+import signal
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +16,8 @@ from aiohttp import web
 
 from neuralclaw.config import get_api_key, load_config
 from neuralclaw.gateway import NeuralClawGateway
+
+logger = logging.getLogger("mesh_gateway")
 
 
 ASK_PATTERN = re.compile(
@@ -70,16 +75,24 @@ class MeshDelegateRouter:
             return None
         return target, task
 
-    async def delegate(self, from_agent: str, target_name: str, task: str) -> str | None:
+    async def delegate(self, from_agent: str, target_name: str, task: str) -> tuple[str | None, str | None]:
+        """Returns (result, error_reason). Both can be None only if not a delegation context."""
         if not self.enabled:
-            return None
+            logger.warning("[MESH] Delegation attempted but NEURALCLAW_MESH_ENABLED is not true")
+            return None, "mesh is not enabled on this agent"
+
         peer = self._find_peer(target_name)
         if not peer:
-            return None
+            known = [str(p.get("agentName") or p.get("name") or "") for p in self.peers]
+            logger.warning("[MESH] Peer '%s' not found. Known peers: %s", target_name, known or ["(none)"])
+            if not self.peers:
+                return None, "no mesh peers are configured — check NEURALCLAW_MESH_PEERS_JSON"
+            return None, f"agent '{target_name}' is not in your mesh peer list (known: {', '.join(known)})"
 
         endpoint = str(peer.get("endpoint") or peer.get("meshEndpoint") or "").rstrip("/")
         if not endpoint:
-            return None
+            logger.warning("[MESH] Peer '%s' found but has no endpoint set", target_name)
+            return None, f"agent '{target_name}' has no endpoint configured"
 
         # Expects peer runtime endpoint to support /a2a/message.
         payload = {
@@ -94,16 +107,28 @@ class MeshDelegateRouter:
         if shared:
             headers["x-mesh-secret"] = shared
 
+        logger.info("[MESH] Delegating to '%s' at %s — task: %s", target_name, endpoint, task[:80])
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout)) as session:
                 async with session.post(f"{endpoint}/a2a/message", json=payload, headers=headers) as resp:
+                    if resp.status == 401:
+                        logger.error("[MESH] Peer '%s' rejected request: unauthorized (wrong shared secret?)", target_name)
+                        return None, f"agent '{target_name}' rejected the request (unauthorized)"
                     if resp.status != 200:
-                        return None
+                        logger.error("[MESH] Peer '%s' returned HTTP %d", target_name, resp.status)
+                        return None, f"agent '{target_name}' returned an error (HTTP {resp.status})"
                     data = await resp.json()
                     content = str(data.get("content", "")).strip()
-                    return content or None
-        except Exception:
-            return None
+                    if not content:
+                        return None, f"agent '{target_name}' returned an empty response"
+                    logger.info("[MESH] Delegation to '%s' succeeded", target_name)
+                    return content, None
+        except asyncio.TimeoutError:
+            logger.error("[MESH] Delegation to '%s' timed out after %ss", target_name, self.timeout)
+            return None, f"agent '{target_name}' did not respond within {int(self.timeout)}s"
+        except Exception as exc:
+            logger.error("[MESH] Delegation to '%s' failed: %s", target_name, exc)
+            return None, f"could not reach agent '{target_name}': {exc}"
 
 
 class MeshAwareGateway(NeuralClawGateway):
@@ -122,9 +147,13 @@ class MeshAwareGateway(NeuralClawGateway):
         parsed = self._mesh_router.parse_command(content)
         if parsed:
             target, task = parsed
-            delegated = await self._mesh_router.delegate(self._config.name, target, task)
-            if delegated:
-                return delegated
+            result, error = await self._mesh_router.delegate(self._config.name, target, task)
+            if result:
+                return result
+            # Delegation was explicitly attempted but failed — return the reason.
+            # Do NOT fall through to the local LLM; it would try to answer "ask X to ..."
+            # as a normal query and fail (or give a nonsensical answer).
+            return f"Could not delegate to '{target}': {error}"
         return await super().process_message(
             content=content,
             author_id=author_id,
@@ -132,6 +161,16 @@ class MeshAwareGateway(NeuralClawGateway):
             channel_id=channel_id,
             channel_type_name=channel_type_name,
         )
+
+
+async def _handle_health(request: web.Request) -> web.Response:
+    gw: MeshAwareGateway = request.app["gateway"]
+    mesh = gw._mesh_router
+    return web.json_response({
+        "status": "ok",
+        "mesh_enabled": mesh.enabled,
+        "peers": len(mesh.peers),
+    })
 
 
 async def _handle_a2a_message(request: web.Request) -> web.Response:
@@ -202,14 +241,35 @@ async def _run_gateway() -> None:
     mesh_port = int(os.getenv("NEURALCLAW_MESH_PORT", os.getenv("PORT", "8100")))
     app = web.Application()
     app["gateway"] = gw
-    app.add_routes([web.post("/a2a/message", _handle_a2a_message)])
+    app.add_routes([
+        web.get("/health", _handle_health),
+        web.post("/a2a/message", _handle_a2a_message),
+    ])
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", mesh_port)
     await site.start()
 
+    loop = asyncio.get_running_loop()
+
+    async def _shutdown(sig_name: str) -> None:
+        logger.info("[runtime] received %s — shutting down gracefully", sig_name)
+        await gw.stop()
+        await runner.cleanup()
+        loop.stop()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_shutdown(s.name)))
+        except NotImplementedError:
+            # Windows does not support add_signal_handler
+            pass
+
+    logger.info("[runtime] gateway started on port %d (mesh_enabled=%s, peers=%d)",
+                mesh_port, gw._mesh_router.enabled, len(gw._mesh_router.peers))
     await gw.run_forever()
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     asyncio.run(_run_gateway())

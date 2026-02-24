@@ -13,6 +13,7 @@ MODEL="${NEURALCLAW_MODEL:-gpt-4o}"
 MESH_ENABLED_RAW="${NEURALCLAW_MESH_ENABLED:-false}"
 MESH_PEERS_JSON="${NEURALCLAW_MESH_PEERS_JSON:-}"
 ENABLE_DASHBOARD_RAW="${NEURALCLAW_ENABLE_DASHBOARD:-false}"
+LOCAL_URL="${NEURALCLAW_LOCAL_URL:-}"
 
 to_bool() {
   local v="${1:-false}"
@@ -28,6 +29,13 @@ to_bool() {
 MESH_ENABLED="$(to_bool "$MESH_ENABLED_RAW")"
 ENABLE_DASHBOARD="$(to_bool "$ENABLE_DASHBOARD_RAW")"
 
+# Build the fallback list: only include "local" if an Ollama URL is explicitly provided.
+if [[ -n "$LOCAL_URL" ]]; then
+  FALLBACK_TOML='fallback = ["local"]'
+else
+  FALLBACK_TOML='fallback = []'
+fi
+
 if [[ -n "$MESH_PEERS_JSON" ]]; then
   # Persist for runtime adapters/debug; current upstream gateway does not auto-consume this file yet.
   printf '%s\n' "$MESH_PEERS_JSON" > "$HOME/.neuralclaw/mesh-peers.json"
@@ -42,7 +50,7 @@ telemetry_stdout = true
 
 [providers]
 primary = "${PROVIDER}"
-fallback = ["local"]
+${FALLBACK_TOML}
 
 [providers.openai]
 model = "${MODEL}"
@@ -58,7 +66,7 @@ base_url = "https://openrouter.ai/api/v1"
 
 [providers.local]
 model = "${MODEL}"
-base_url = "http://localhost:11434/v1"
+base_url = "${LOCAL_URL:-http://localhost:11434/v1}"
 
 [memory]
 db_path = "${HOME}/.neuralclaw/data/memory.db"
