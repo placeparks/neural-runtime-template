@@ -10,6 +10,28 @@ pip install "neuralclaw[all-channels]"
 AGENT_NAME="${NEURALCLAW_AGENT_NAME:-NeuralClaw}"
 PROVIDER="${NEURALCLAW_PROVIDER:-openai}"
 MODEL="${NEURALCLAW_MODEL:-gpt-4o}"
+MESH_ENABLED_RAW="${NEURALCLAW_MESH_ENABLED:-false}"
+MESH_PEERS_JSON="${NEURALCLAW_MESH_PEERS_JSON:-}"
+ENABLE_DASHBOARD_RAW="${NEURALCLAW_ENABLE_DASHBOARD:-false}"
+
+to_bool() {
+  local v="${1:-false}"
+  shopt -s nocasematch
+  if [[ "$v" == "1" || "$v" == "true" || "$v" == "yes" || "$v" == "on" ]]; then
+    echo "true"
+  else
+    echo "false"
+  fi
+  shopt -u nocasematch
+}
+
+MESH_ENABLED="$(to_bool "$MESH_ENABLED_RAW")"
+ENABLE_DASHBOARD="$(to_bool "$ENABLE_DASHBOARD_RAW")"
+
+if [[ -n "$MESH_PEERS_JSON" ]]; then
+  # Persist for runtime adapters/debug; current upstream gateway does not auto-consume this file yet.
+  printf '%s\n' "$MESH_PEERS_JSON" > "$HOME/.neuralclaw/mesh-peers.json"
+fi
 
 cat > "$HOME/.neuralclaw/config.toml" <<EOF
 [general]
@@ -50,8 +72,8 @@ block_threshold = 0.9
 allow_shell_execution = false
 
 [features]
-swarm = false
-dashboard = false
+swarm = ${MESH_ENABLED}
+dashboard = ${ENABLE_DASHBOARD}
 evolution = false
 reflective_reasoning = true
 procedural_memory = true
@@ -63,6 +85,11 @@ enabled = true
 [channels.discord]
 enabled = true
 EOF
+
+echo "[runtime] agent=${AGENT_NAME} provider=${PROVIDER} model=${MODEL} mesh_enabled=${MESH_ENABLED} dashboard=${ENABLE_DASHBOARD}"
+if [[ -f "$HOME/.neuralclaw/mesh-peers.json" ]]; then
+  echo "[runtime] mesh peers file written: $HOME/.neuralclaw/mesh-peers.json"
+fi
 
 # Railway sets PORT for web-facing services; NeuralClaw gateway has its own channel listeners.
 # This process is long-running.
