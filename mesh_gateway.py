@@ -221,6 +221,14 @@ async def _handle_a2a_message(request: web.Request) -> web.Response:
 
 
 async def _run_gateway() -> None:
+    # Small startup delay so the previous container's Telegram polling
+    # has time to stop before this instance starts polling.
+    # Prevents 409 Conflict during Railway rolling deploys.
+    startup_delay = float(os.getenv("NEURALCLAW_STARTUP_DELAY", "8"))
+    if startup_delay > 0:
+        logger.info("[runtime] startup delay %.0fs (set NEURALCLAW_STARTUP_DELAY=0 to skip)", startup_delay)
+        await asyncio.sleep(startup_delay)
+
     config = load_config()
     gw = MeshAwareGateway(config)
 
