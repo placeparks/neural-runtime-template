@@ -65,6 +65,16 @@ ASK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+KNOWLEDGE_QUERY_PATTERN = re.compile(
+    r"\b("
+    r"knowledge|knowledge\s*base|docs?|document|file|stored|"
+    r"nexus|memory|plan|architecture|delivery|"
+    r"based\s+on|from\s+the\s+docs|what\s+do\s+you\s+know|"
+    r"do\s+you\s+have"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def _normalize(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
@@ -175,6 +185,27 @@ class MeshAwareGateway(NeuralClawGateway):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._mesh_router = MeshDelegateRouter()
+        self._knowledge_max_chars = int(os.getenv("NEURALCLAW_KNOWLEDGE_MAX_INJECT_CHARS", "12000"))
+
+    def _is_knowledge_query(self, content: str) -> bool:
+        return bool(KNOWLEDGE_QUERY_PATTERN.search(content))
+
+    def _knowledge_snippet(self) -> str:
+        if not _KNOWLEDGE_PATH.exists():
+            return ""
+        try:
+            text = _KNOWLEDGE_PATH.read_text(encoding="utf-8", errors="ignore").strip()
+        except Exception as exc:
+            logger.warning("[runtime] could not read knowledge file: %s", exc)
+            return ""
+        if not text:
+            return ""
+        if len(text) <= self._knowledge_max_chars:
+            return text
+        return (
+            text[: self._knowledge_max_chars]
+            + "\n\n[knowledge truncated due to size; answer from available section only]"
+        )
 
     async def process_message(
         self,
@@ -194,8 +225,20 @@ class MeshAwareGateway(NeuralClawGateway):
             # Do NOT fall through to the local LLM; it would try to answer "ask X to ..."
             # as a normal query and fail (or give a nonsensical answer).
             return f"Could not delegate to '{target}': {error}"
+
+        resolved_content = content
+        if self._is_knowledge_query(content):
+            snippet = self._knowledge_snippet()
+            if snippet:
+                logger.info("[runtime] knowledge context injected for query")
+                resolved_content = (
+                    "Use the knowledge context below to answer the user.\n"
+                    "If the requested detail is not present, clearly say it is not in stored knowledge.\n\n"
+                    f"KNOWLEDGE_CONTEXT:\n{snippet}\n\n"
+                    f"USER_MESSAGE:\n{content}"
+                )
         return await super().process_message(
-            content=content,
+            content=resolved_content,
             author_id=author_id,
             author_name=author_name,
             channel_id=channel_id,
