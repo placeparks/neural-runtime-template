@@ -41,6 +41,12 @@ if [[ -n "$MESH_PEERS_JSON" ]]; then
   printf '%s\n' "$MESH_PEERS_JSON" > "$HOME/.neuralclaw/mesh-peers.json"
 fi
 
+KNOWLEDGE_CONTENT="${NEURALCLAW_KNOWLEDGE_CONTENT:-}"
+if [[ -n "$KNOWLEDGE_CONTENT" ]]; then
+  printf '%s\n' "$KNOWLEDGE_CONTENT" > "$HOME/.neuralclaw/knowledge.txt"
+  echo "[runtime] knowledge base written (${#KNOWLEDGE_CONTENT} bytes)"
+fi
+
 cat > "$HOME/.neuralclaw/config.toml" <<EOF
 [general]
 name = "${AGENT_NAME}"

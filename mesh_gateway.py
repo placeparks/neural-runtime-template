@@ -40,6 +40,23 @@ except Exception as _patch_err:  # pragma: no cover
     logging.getLogger("mesh_gateway").warning("Could not apply ToolCall patch: %s", _patch_err)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Knowledge base: if ~/.neuralclaw/knowledge.txt exists, enable file_ops
+# for that directory so the agent can read it with the read_file tool.
+# ---------------------------------------------------------------------------
+_KNOWLEDGE_PATH = Path.home() / ".neuralclaw" / "knowledge.txt"
+if _KNOWLEDGE_PATH.exists():
+    try:
+        from neuralclaw.skills.builtins.file_ops import set_allowed_roots
+        set_allowed_roots([_KNOWLEDGE_PATH.parent])
+        logging.getLogger("mesh_gateway").info(
+            "[runtime] knowledge base available (%d bytes) — file_ops enabled",
+            _KNOWLEDGE_PATH.stat().st_size,
+        )
+    except Exception as _kb_err:  # pragma: no cover
+        logging.getLogger("mesh_gateway").warning("Could not enable file_ops for knowledge base: %s", _kb_err)
+# ---------------------------------------------------------------------------
+
 logger = logging.getLogger("mesh_gateway")
 
 
@@ -230,6 +247,16 @@ async def _run_gateway() -> None:
         await asyncio.sleep(startup_delay)
 
     config = load_config()
+
+    # Inject knowledge base hint into persona so the LLM knows to use read_file
+    if _KNOWLEDGE_PATH.exists():
+        knowledge_hint = (
+            f"\n\nYou have access to a knowledge base stored at '{_KNOWLEDGE_PATH}'. "
+            "When a user asks about stored information, company details, or anything "
+            "that might be in the knowledge base, use the read_file tool to read it first."
+        )
+        config.persona = (config.persona or "") + knowledge_hint
+
     gw = MeshAwareGateway(config)
 
     for ch_config in config.channels:
