@@ -3,6 +3,15 @@ set -euo pipefail
 
 mkdir -p "$HOME/.neuralclaw" "$HOME/.neuralclaw/data" "$HOME/.neuralclaw/logs"
 
+# Prefer Railway volume for WhatsApp auth/session persistence across redeploys.
+# If /data is mounted and caller did not set a custom path, use /data/whatsapp.
+if [[ -z "${NEURALCLAW_WHATSAPP_SESSION_DIR:-}" && -d "/data" ]]; then
+  export NEURALCLAW_WHATSAPP_SESSION_DIR="/data/whatsapp"
+fi
+if [[ -n "${NEURALCLAW_WHATSAPP_SESSION_DIR:-}" ]]; then
+  mkdir -p "${NEURALCLAW_WHATSAPP_SESSION_DIR}"
+fi
+
 AGENT_NAME="${NEURALCLAW_AGENT_NAME:-NeuralClaw}"
 PROVIDER="${NEURALCLAW_PROVIDER:-openai}"
 MODEL="${NEURALCLAW_MODEL:-gpt-4o}"

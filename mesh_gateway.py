@@ -429,6 +429,12 @@ async def _handle_a2a_message(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 
 _WA_BRIDGE_DIR = Path("/app/wa_bridge")
+_WA_SESSION_BASE = Path(
+    os.getenv(
+        "NEURALCLAW_WHATSAPP_SESSION_DIR",
+        ("/data/whatsapp" if Path("/data").exists() else str(Path.home() / ".neuralclaw" / "data" / "whatsapp")),
+    )
+)
 
 try:
     from neuralclaw.channels.protocol import ChannelAdapter as _ChannelAdapterBase
@@ -463,7 +469,7 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
     def __init__(self, session_name: str = "default") -> None:
         super().__init__()
         self._session_name = session_name
-        self._session_dir = str(_WA_BRIDGE_DIR / f"session-{session_name}")
+        self._session_dir = str(_WA_SESSION_BASE / f"session-{session_name}")
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -478,6 +484,7 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
     async def start(self) -> None:
         self._stopping = False
         _WA_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
+        Path(self._session_dir).mkdir(parents=True, exist_ok=True)
         bridge_file = _WA_BRIDGE_DIR / "bridge.mjs"
         bridge_file.write_text(self._bridge_script(), encoding="utf-8")
         await self._spawn_bridge(bridge_file)
