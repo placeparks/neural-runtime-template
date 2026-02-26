@@ -587,7 +587,7 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
                             author_id=data.get("from", "unknown"),
                             author_name=data.get("name", "Unknown"),
                             channel_id=chat_id,
-                            metadata={"platform": "whatsapp"},
+                            metadata={"platform": "whatsapp", "source": "whatsapp", "channel": "whatsapp"},
                         )
                         await self._dispatch(msg)
                     except Exception as exc:
