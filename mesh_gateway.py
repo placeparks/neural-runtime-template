@@ -400,17 +400,20 @@ async def _handle_a2a_message(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
-# QRTrackingWhatsAppAdapter — self-contained WhatsApp adapter for the runtime.
+# QRTrackingWhatsAppAdapter — pure-Python WhatsApp adapter via Evolution API.
 #
-# Uses @whiskeysockets/baileys (pure JS, no Chromium/Puppeteer required).
-# Exposes .qr / .connected / .ready so _extract_whatsapp_debug_state() and
-# the /channels/whatsapp endpoint can surface them to the dashboard.
+# No Node.js, no npm, no Chromium. Uses aiohttp (already installed) to talk
+# to an Evolution API instance over HTTP.
 #
-# The bridge script is written to /app/wa_bridge/bridge.mjs at startup so
-# Node ESM imports can resolve packages from /app/wa_bridge/node_modules/.
+# Required env vars in the runtime container:
+#   NEURALCLAW_WHATSAPP_BRIDGE_URL      — Evolution API base URL
+#   NEURALCLAW_WHATSAPP_BRIDGE_API_KEY  — Evolution API key
+#   NEURALCLAW_WHATSAPP_API_KEY         — instance name (set by provisioner)
+#
+# Optional:
+#   NEURALCLAW_PUBLIC_URL               — runtime's public URL for webhook
+#                                         registration (e.g. https://xxx.railway.app)
 # ---------------------------------------------------------------------------
-
-_WA_BRIDGE_DIR = Path("/app/wa_bridge")
 
 try:
     from neuralclaw.channels.protocol import ChannelAdapter as _ChannelAdapterBase
@@ -435,160 +438,213 @@ except Exception:
 
 class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
     """
-    WhatsApp adapter built into mesh_gateway.py.
-
-    Replaces the PyPI WhatsAppAdapter so no package republish is needed.
-    Uses @whiskeysockets/baileys instead of whatsapp-web.js — no Chromium
-    or Puppeteer, so the container stays small and boots faster.
+    WhatsApp adapter that talks to an Evolution API instance over HTTP.
+    Exposes .qr / .connected / .ready for the /channels/whatsapp endpoint.
     """
 
     name = "whatsapp"
 
-    def __init__(self, session_name: str = "default") -> None:
+    def __init__(self, instance_name: str) -> None:
         super().__init__()
-        self._session_name = session_name
-        self._session_dir = str(_WA_BRIDGE_DIR / f"session-{session_name}")
-        self._process: asyncio.subprocess.Process | None = None
-        self._reader_task: asyncio.Task[None] | None = None
+        self._instance_name = instance_name
+        self._evo_url = (
+            os.getenv("NEURALCLAW_WHATSAPP_BRIDGE_URL") or
+            os.getenv("EVOLUTION_API_URL") or ""
+        ).rstrip("/")
+        self._evo_key = (
+            os.getenv("NEURALCLAW_WHATSAPP_BRIDGE_API_KEY") or
+            os.getenv("EVOLUTION_API_KEY") or
+            os.getenv("AUTHENTICATION_API_KEY") or ""
+        )
+        self._poll_task: asyncio.Task[None] | None = None
         self.qr: str | None = None
         self.connected: bool = False
         self.ready: bool = False
 
-    async def start(self) -> None:
-        _WA_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
-        bridge_file = _WA_BRIDGE_DIR / "bridge.mjs"
-        bridge_file.write_text(self._bridge_script(), encoding="utf-8")
+    @property
+    def _configured(self) -> bool:
+        return bool(self._evo_url and self._evo_key)
 
-        self._process = await asyncio.create_subprocess_exec(
-            "node", str(bridge_file),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        self._reader_task = asyncio.create_task(self._read_messages())
-        logger.info("[WhatsApp] Baileys bridge started — scan QR from dashboard if prompted")
+    async def start(self) -> None:
+        if not self._configured:
+            logger.warning(
+                "[WhatsApp] NEURALCLAW_WHATSAPP_BRIDGE_URL / NEURALCLAW_WHATSAPP_BRIDGE_API_KEY "
+                "not set — WhatsApp channel inactive"
+            )
+            return
+        await self._ensure_instance()
+        await self._register_webhook()
+        self._poll_task = asyncio.create_task(self._poll_loop())
+        logger.info("[WhatsApp] Evolution API adapter started for instance '%s'", self._instance_name)
 
     async def stop(self) -> None:
-        if self._process:
-            self._process.terminate()
-            await self._process.wait()
-        if self._reader_task:
-            self._reader_task.cancel()
+        if self._poll_task:
+            self._poll_task.cancel()
             try:
-                await self._reader_task
+                await self._poll_task
             except asyncio.CancelledError:
                 pass
 
     async def send(self, channel_id: str, content: str, **kwargs: Any) -> None:
-        if self._process and self._process.stdin:
-            payload = json.dumps({"type": "send", "to": channel_id, "content": content})
-            self._process.stdin.write(f"{payload}\n".encode())
-            await self._process.stdin.drain()
-
-    async def _read_messages(self) -> None:
-        if not self._process or not self._process.stdout:
+        if not self._configured:
             return
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{self._evo_url}/message/sendText/{self._instance_name}",
+                    headers={"apikey": self._evo_key, "Content-Type": "application/json"},
+                    json={"number": channel_id, "text": content},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status not in (200, 201):
+                        logger.warning("[WhatsApp] sendText failed: HTTP %d", resp.status)
+        except Exception as exc:
+            logger.warning("[WhatsApp] send error: %s", exc)
+
+    async def _ensure_instance(self) -> None:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"{self._evo_url}/instance/connect/{self._instance_name}",
+                    headers={"apikey": self._evo_key},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        return  # already exists
+                async with s.post(
+                    f"{self._evo_url}/instance/create",
+                    headers={"apikey": self._evo_key, "Content-Type": "application/json"},
+                    json={"instanceName": self._instance_name, "qrcode": True, "integration": "WHATSAPP-BAILEYS"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status not in (200, 201):
+                        text = await resp.text()
+                        logger.warning("[WhatsApp] instance create failed: HTTP %d — %s", resp.status, text[:200])
+        except Exception as exc:
+            logger.warning("[WhatsApp] ensure instance error: %s", exc)
+
+    async def _register_webhook(self) -> None:
+        public_url = (os.getenv("NEURALCLAW_PUBLIC_URL") or "").rstrip("/")
+        if not public_url:
+            return
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{self._evo_url}/webhook/set/{self._instance_name}",
+                    headers={"apikey": self._evo_key, "Content-Type": "application/json"},
+                    json={
+                        "url": f"{public_url}/channels/whatsapp/webhook",
+                        "webhook_by_events": False,
+                        "webhook_base64": False,
+                        "events": ["MESSAGES_UPSERT"],
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status in (200, 201):
+                        logger.info("[WhatsApp] Webhook registered at %s", public_url)
+        except Exception as exc:
+            logger.warning("[WhatsApp] webhook registration error: %s", exc)
+
+    async def _poll_loop(self) -> None:
         while True:
             try:
-                line = await self._process.stdout.readline()
-                if not line:
-                    break
-                data = json.loads(line.decode().strip())
-                t = data.get("type")
-                if t == "qr":
-                    self.qr = data.get("data")
-                    self.connected = False
-                    self.ready = False
-                elif t == "ready":
-                    self.qr = None
-                    self.connected = True
-                    self.ready = True
-                elif t == "message":
-                    try:
-                        from neuralclaw.channels.protocol import ChannelMessage
-                        msg = ChannelMessage(
-                            content=data.get("content", ""),
-                            author_id=data.get("from", "unknown"),
-                            author_name=data.get("name", "Unknown"),
-                            channel_id=data.get("chat_id", ""),
-                            metadata={"platform": "whatsapp"},
-                        )
-                        await self._dispatch(msg)
-                    except Exception as exc:
-                        logger.warning("[WhatsApp] dispatch error: %s", exc)
-            except json.JSONDecodeError:
-                continue
+                await self._refresh_state()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.warning("[WhatsApp] read error: %s", exc)
-                await asyncio.sleep(1)
+                logger.debug("[WhatsApp] poll error: %s", exc)
+            await asyncio.sleep(5)
 
-    def _bridge_script(self) -> str:
-        session_dir_js = json.dumps(self._session_dir)
-        return f"""
-import {{ makeWASocket, useMultiFileAuthState, DisconnectReason }} from '@whiskeysockets/baileys';
-import QRCode from 'qrcode';
-import {{ createInterface }} from 'readline';
+    async def _refresh_state(self) -> None:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"{self._evo_url}/instance/connectionState/{self._instance_name}",
+                headers={"apikey": self._evo_key},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    state = (data.get("instance") or {}).get("state", "")
+                    if state == "open":
+                        self.connected = True
+                        self.ready = True
+                        self.qr = None
+                        return
 
-const SESSION_DIR = {session_dir_js};
+            self.connected = False
+            self.ready = False
+            async with s.get(
+                f"{self._evo_url}/instance/connect/{self._instance_name}",
+                headers={"apikey": self._evo_key},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self.qr = self._pick_qr(data)
 
-async function main() {{
-    const {{ state, saveCreds }} = await useMultiFileAuthState(SESSION_DIR);
-    const sock = makeWASocket({{ auth: state, printQRInTerminal: false }});
+    @staticmethod
+    def _pick_qr(data: Any) -> str | None:
+        if not isinstance(data, dict):
+            return None
+        qrcode = data.get("qrcode") if isinstance(data.get("qrcode"), dict) else {}
+        for val in (
+            data.get("base64"), data.get("qr"), data.get("code"),
+            qrcode.get("base64"), qrcode.get("qr"), qrcode.get("code"),
+        ):
+            if not isinstance(val, str) or not val.strip():
+                continue
+            v = val.strip()
+            if v.startswith("data:image/"):
+                return v
+            if len(v) > 120:
+                return f"data:image/png;base64,{v}" if re.match(r"^[A-Za-z0-9+/=]+$", v) else v
+        return None
 
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', async ({{ connection, qr, lastDisconnect }}) => {{
-        if (qr) {{
-            try {{
-                const dataUrl = await QRCode.toDataURL(qr);
-                process.stdout.write(JSON.stringify({{ type: 'qr', data: dataUrl }}) + '\\n');
-            }} catch {{
-                process.stdout.write(JSON.stringify({{ type: 'qr', data: qr }}) + '\\n');
-            }}
-        }}
-        if (connection === 'open') {{
-            process.stdout.write(JSON.stringify({{ type: 'ready' }}) + '\\n');
-        }}
-        if (connection === 'close') {{
-            const code = lastDisconnect?.error?.output?.statusCode;
-            if (code !== DisconnectReason.loggedOut) setTimeout(main, 3000);
-        }}
-    }});
-
-    sock.ev.on('messages.upsert', async ({{ messages }}) => {{
-        for (const msg of messages) {{
-            if (!msg.message || msg.key.fromMe) continue;
-            const body = msg.message.conversation
-                ?? msg.message.extendedTextMessage?.text
-                ?? '';
-            if (!body) continue;
-            process.stdout.write(JSON.stringify({{
-                type: 'message', content: body,
-                from: msg.key.remoteJid, name: msg.pushName || 'Unknown',
-                chat_id: msg.key.remoteJid,
-            }}) + '\\n');
-        }}
-    }});
-
-    const rl = createInterface({{ input: process.stdin }});
-    rl.on('line', async line => {{
-        try {{
-            const cmd = JSON.parse(line);
-            if (cmd.type === 'send') await sock.sendMessage(cmd.to, {{ text: cmd.content }});
-        }} catch {{}}
-    }});
-}}
-
-main().catch(e => process.stderr.write(String(e) + '\\n'));
-"""
+    async def handle_webhook(self, data: dict[str, Any]) -> None:
+        """Called by the /channels/whatsapp/webhook HTTP handler."""
+        event_data = data.get("data") or {}
+        messages = event_data if isinstance(event_data, list) else [event_data]
+        for msg in messages:
+            key = msg.get("key") or {}
+            if key.get("fromMe"):
+                continue
+            message = msg.get("message") or {}
+            body = (
+                message.get("conversation") or
+                (message.get("extendedTextMessage") or {}).get("text") or
+                ""
+            )
+            if not body:
+                continue
+            try:
+                from neuralclaw.channels.protocol import ChannelMessage
+                channel_msg = ChannelMessage(
+                    content=body,
+                    author_id=key.get("remoteJid", "unknown"),
+                    author_name=msg.get("pushName", "Unknown"),
+                    channel_id=key.get("remoteJid", ""),
+                    metadata={"platform": "whatsapp"},
+                )
+                await self._dispatch(channel_msg)
+            except Exception as exc:
+                logger.warning("[WhatsApp] webhook dispatch error: %s", exc)
 
 
 async def _handle_whatsapp_status(request: web.Request) -> web.Response:
     adapter = request.app.get("whatsapp_adapter")
     state = _extract_whatsapp_debug_state(adapter)
     return web.json_response(state)
+
+
+async def _handle_whatsapp_webhook(request: web.Request) -> web.Response:
+    adapter = request.app.get("whatsapp_adapter")
+    if isinstance(adapter, QRTrackingWhatsAppAdapter):
+        try:
+            data = await request.json()
+            await adapter.handle_webhook(data)
+        except Exception as exc:
+            logger.warning("[WhatsApp] webhook error: %s", exc)
+    return web.json_response({"ok": True})
 
 
 async def _run_gateway() -> None:
@@ -657,6 +713,7 @@ async def _run_gateway() -> None:
     app.add_routes([
         web.get("/health", _handle_health),
         web.get("/channels/whatsapp", _handle_whatsapp_status),
+        web.post("/channels/whatsapp/webhook", _handle_whatsapp_webhook),
         web.post("/a2a/message", _handle_a2a_message),
     ])
     runner = web.AppRunner(app)
