@@ -720,7 +720,7 @@ async def _handle_whatsapp_status(request: web.Request) -> web.Response:
     return web.json_response(state)
 
 
-class LocalSlackAdapter:
+class LocalSlackAdapter(_ChannelAdapterBase):
     """
     Slack adapter pinned in runtime template so we can enforce metadata.source
     regardless of the currently installed neuralclaw package version.
@@ -729,21 +729,12 @@ class LocalSlackAdapter:
     name = "slack"
 
     def __init__(self, bot_token: str, app_token: str) -> None:
-        from neuralclaw.channels.protocol import ChannelAdapter
-
-        # composition instead of inheritance to avoid import-time coupling
-        self._base = ChannelAdapter()
+        super().__init__()
         self._bot_token = bot_token
         self._app_token = app_token
         self._app: Any = None
         self._handler: Any = None
         self._task: asyncio.Task[None] | None = None
-
-    def add_handler(self, handler: Any) -> None:
-        self._base.add_handler(handler)
-
-    async def _dispatch(self, msg: Any) -> None:
-        await self._base._dispatch(msg)
 
     async def start(self) -> None:
         try:
