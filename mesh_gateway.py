@@ -121,7 +121,7 @@ def _extract_qr_like(value: Any) -> str | None:
 
 def _extract_whatsapp_debug_state(adapter: Any) -> dict[str, Any]:
     if adapter is None:
-        return {"enabled": False, "connected": False, "ready": False, "qr": None}
+        return {"enabled": False, "connected": False, "ready": False, "qr": None, "reason": "adapter_missing"}
 
     qr_candidates = (
         "qr",
@@ -135,10 +135,12 @@ def _extract_whatsapp_debug_state(adapter: Any) -> dict[str, Any]:
     )
     state_candidates = ("connected", "ready", "authenticated", "logged_in", "is_connected")
     nested_candidates = ("client", "bridge", "session", "state", "_client", "_bridge")
+    reason_candidates = ("reason", "last_error", "error", "_last_error")
 
     connected: bool | None = None
     ready: bool | None = None
     qr: str | None = None
+    reason: str | None = None
 
     # Direct adapter attrs
     for name in qr_candidates:
@@ -155,6 +157,12 @@ def _extract_whatsapp_debug_state(adapter: Any) -> dict[str, Any]:
                     ready = raw if ready is None else ready
                 else:
                     connected = raw if connected is None else connected
+    for name in reason_candidates:
+        if hasattr(adapter, name):
+            raw = _maybe_call(getattr(adapter, name))
+            if isinstance(raw, str) and raw.strip():
+                reason = raw.strip()
+                break
 
     # Nested attrs
     for parent in nested_candidates:
@@ -180,6 +188,13 @@ def _extract_whatsapp_debug_state(adapter: Any) -> dict[str, Any]:
                         ready = raw if ready is None else ready
                     else:
                         connected = raw if connected is None else connected
+        if not reason:
+            for name in reason_candidates:
+                if hasattr(node, name):
+                    raw = _maybe_call(getattr(node, name))
+                    if isinstance(raw, str) and raw.strip():
+                        reason = raw.strip()
+                        break
 
     # Reasonable fallback semantics.
     if ready is None and connected is not None:
@@ -190,12 +205,15 @@ def _extract_whatsapp_debug_state(adapter: Any) -> dict[str, Any]:
         connected = False
     if ready is None:
         ready = False
+    if not reason and not ready and not qr:
+        reason = "waiting_for_qr"
 
     return {
         "enabled": True,
         "connected": connected,
         "ready": ready,
         "qr": qr,
+        "reason": reason,
     }
 
 
@@ -434,7 +452,7 @@ except Exception:
 
 class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
     """
-    Direct Baileys WhatsApp adapter — same pattern as OpenClaw.
+    Direct Baileys WhatsApp adapter - same pattern as OpenClaw.
     Spawns a Node.js subprocess running @whiskeysockets/baileys.
     Exposes .qr / .connected / .ready for the /channels/whatsapp endpoint.
     """
@@ -447,15 +465,18 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
         self._session_dir = str(_WA_BRIDGE_DIR / f"session-{session_name}")
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
         self.qr: str | None = None
         self.connected: bool = False
         self.ready: bool = False
+        self.reason: str | None = "initializing"
 
     async def start(self) -> None:
         _WA_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
         bridge_file = _WA_BRIDGE_DIR / "bridge.mjs"
         bridge_file.write_text(self._bridge_script(), encoding="utf-8")
 
+        self.reason = "starting_baileys_bridge"
         self._process = await asyncio.create_subprocess_exec(
             "node", str(bridge_file),
             stdin=asyncio.subprocess.PIPE,
@@ -463,7 +484,8 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
             stderr=asyncio.subprocess.PIPE,
         )
         self._reader_task = asyncio.create_task(self._read_messages())
-        logger.info("[WhatsApp] Baileys bridge started — scan QR from dashboard")
+        self._stderr_task = asyncio.create_task(self._read_stderr())
+        logger.info("[WhatsApp] Baileys bridge started - session=%s", self._session_name)
 
     async def stop(self) -> None:
         if self._process:
@@ -473,6 +495,12 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
             self._reader_task.cancel()
             try:
                 await self._reader_task
+            except asyncio.CancelledError:
+                pass
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
             except asyncio.CancelledError:
                 pass
 
@@ -496,10 +524,18 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
                     self.qr = data.get("data")
                     self.connected = False
                     self.ready = False
+                    self.reason = "scan_qr_in_dashboard"
+                    logger.info("[WhatsApp] QR received for session=%s", self._session_name)
                 elif t == "ready":
                     self.qr = None
                     self.connected = True
                     self.ready = True
+                    self.reason = None
+                    logger.info("[WhatsApp] session=%s connected", self._session_name)
+                elif t == "state":
+                    state = str(data.get("value", "")).strip()
+                    if state:
+                        self.reason = f"state:{state}"
                 elif t == "message":
                     try:
                         from neuralclaw.channels.protocol import ChannelMessage
@@ -518,7 +554,32 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
             except asyncio.CancelledError:
                 break
             except Exception as exc:
+                self.reason = f"read_error:{exc}"
                 logger.warning("[WhatsApp] read error: %s", exc)
+                await asyncio.sleep(1)
+        if self._process and self._process.returncode not in (None, 0):
+            self.connected = False
+            self.ready = False
+            self.reason = f"bridge_exited:{self._process.returncode}"
+
+    async def _read_stderr(self) -> None:
+        if not self._process or not self._process.stderr:
+            return
+        while True:
+            try:
+                line = await self._process.stderr.readline()
+                if not line:
+                    break
+                text = line.decode(errors="ignore").strip()
+                if not text:
+                    continue
+                self.reason = text[:500]
+                logger.warning("[WhatsApp][bridge] %s", text)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.reason = f"stderr_error:{exc}"
+                logger.warning("[WhatsApp] stderr read error: %s", exc)
                 await asyncio.sleep(1)
 
     def _bridge_script(self) -> str:
@@ -532,6 +593,7 @@ const SESSION_DIR = {session_dir_js};
 
 async function main() {{
     const {{ state, saveCreds }} = await useMultiFileAuthState(SESSION_DIR);
+    process.stdout.write(JSON.stringify({{ type: 'state', value: 'connecting' }}) + '\n');
     const sock = makeWASocket({{ auth: state, printQRInTerminal: false }});
 
     sock.ev.on('creds.update', saveCreds);
@@ -540,16 +602,17 @@ async function main() {{
         if (qr) {{
             try {{
                 const dataUrl = await QRCode.toDataURL(qr);
-                process.stdout.write(JSON.stringify({{ type: 'qr', data: dataUrl }}) + '\\n');
+                process.stdout.write(JSON.stringify({{ type: 'qr', data: dataUrl }}) + '\n');
             }} catch {{
-                process.stdout.write(JSON.stringify({{ type: 'qr', data: qr }}) + '\\n');
+                process.stdout.write(JSON.stringify({{ type: 'qr', data: qr }}) + '\n');
             }}
         }}
         if (connection === 'open') {{
-            process.stdout.write(JSON.stringify({{ type: 'ready' }}) + '\\n');
+            process.stdout.write(JSON.stringify({{ type: 'ready' }}) + '\n');
         }}
         if (connection === 'close') {{
             const code = lastDisconnect?.error?.output?.statusCode;
+            process.stderr.write(`connection_close code=${{code}}\n`);
             if (code !== DisconnectReason.loggedOut) setTimeout(main, 3000);
         }}
     }});
@@ -565,7 +628,7 @@ async function main() {{
                 type: 'message', content: body,
                 from: msg.key.remoteJid, name: msg.pushName || 'Unknown',
                 chat_id: msg.key.remoteJid,
-            }}) + '\\n');
+            }}) + '\n');
         }}
     }});
 
@@ -578,8 +641,9 @@ async function main() {{
     }});
 }}
 
-main().catch(e => process.stderr.write(String(e) + '\\n'));
+main().catch(e => process.stderr.write(`bridge_fatal ${{String(e)}}\n`));
 """
+
 
 
 async def _handle_whatsapp_status(request: web.Request) -> web.Response:
