@@ -713,6 +713,108 @@ async def _handle_whatsapp_status(request: web.Request) -> web.Response:
     return web.json_response(state)
 
 
+class LocalSlackAdapter:
+    """
+    Slack adapter pinned in runtime template so we can enforce metadata.source
+    regardless of the currently installed neuralclaw package version.
+    """
+
+    name = "slack"
+
+    def __init__(self, bot_token: str, app_token: str) -> None:
+        from neuralclaw.channels.protocol import ChannelAdapter
+
+        # composition instead of inheritance to avoid import-time coupling
+        self._base = ChannelAdapter()
+        self._bot_token = bot_token
+        self._app_token = app_token
+        self._app: Any = None
+        self._handler: Any = None
+        self._task: asyncio.Task[None] | None = None
+
+    def add_handler(self, handler: Any) -> None:
+        self._base.add_handler(handler)
+
+    async def _dispatch(self, msg: Any) -> None:
+        await self._base._dispatch(msg)
+
+    async def start(self) -> None:
+        try:
+            from slack_bolt.async_app import AsyncApp
+            from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+            from neuralclaw.channels.protocol import ChannelMessage
+        except ImportError as exc:
+            raise RuntimeError("slack-bolt not installed. Run: pip install slack-bolt") from exc
+
+        self._app = AsyncApp(token=self._bot_token)
+        adapter = self
+
+        @self._app.event("message")
+        async def handle_message(event: dict, say: Any) -> None:
+            if event.get("bot_id") or event.get("subtype"):
+                return
+
+            msg = ChannelMessage(
+                content=event.get("text", ""),
+                author_id=event.get("user", "unknown"),
+                author_name=event.get("user", "Unknown"),
+                channel_id=event.get("channel", ""),
+                raw=event,
+                metadata={
+                    "platform": "slack",
+                    "source": "slack",
+                    "channel": "slack",
+                    "thread_ts": event.get("thread_ts"),
+                },
+            )
+            await adapter._dispatch(msg)
+
+        @self._app.event("app_mention")
+        async def handle_mention(event: dict, say: Any) -> None:
+            text = event.get("text", "")
+            if "<@" in text:
+                text = text.split(">", 1)[-1].strip()
+
+            msg = ChannelMessage(
+                content=text,
+                author_id=event.get("user", "unknown"),
+                author_name=event.get("user", "Unknown"),
+                channel_id=event.get("channel", ""),
+                raw=event,
+                metadata={
+                    "platform": "slack",
+                    "source": "slack",
+                    "channel": "slack",
+                    "is_mention": True,
+                    "thread_ts": event.get("thread_ts", event.get("ts")),
+                },
+            )
+            await adapter._dispatch(msg)
+
+        self._handler = AsyncSocketModeHandler(self._app, self._app_token)
+        self._task = asyncio.create_task(self._handler.start_async())
+        logger.info("[Slack] Bot started in Socket Mode (local adapter)")
+
+    async def stop(self) -> None:
+        if self._handler:
+            await self._handler.close_async()
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def send(self, channel_id: str, content: str, **kwargs: Any) -> None:
+        if self._app:
+            thread_ts = kwargs.get("thread_ts")
+            await self._app.client.chat_postMessage(
+                channel=channel_id,
+                text=content,
+                thread_ts=thread_ts,
+            )
+
+
 
 
 async def _run_gateway() -> None:
@@ -753,9 +855,7 @@ async def _run_gateway() -> None:
     slack_bot = get_api_key("slack_bot")
     slack_app = get_api_key("slack_app")
     if slack_bot and slack_app:
-        from neuralclaw.channels.slack import SlackAdapter
-
-        gw.add_channel(SlackAdapter(slack_bot, slack_app))
+        gw.add_channel(LocalSlackAdapter(slack_bot, slack_app))
 
     whatsapp_session = get_api_key("whatsapp")
     whatsapp_adapter: Any = None
