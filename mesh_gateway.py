@@ -80,6 +80,125 @@ def _normalize(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
+def _maybe_call(value: Any) -> Any:
+    try:
+        if callable(value):
+            return value()
+    except Exception:
+        return None
+    return value
+
+
+def _extract_qr_like(value: Any) -> str | None:
+    """Try to normalize any QR-like value to string."""
+    value = _maybe_call(value)
+    if value is None:
+        return None
+
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            text = value.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return None
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
+
+    if not text:
+        return None
+
+    # Common representations:
+    # - data:image/png;base64,...
+    # - raw long base64-like payload
+    # - textual QR payload for terminal rendering
+    if text.startswith("data:image/"):
+        return text
+    if len(text) > 120:
+        return text
+    return None
+
+
+def _extract_whatsapp_debug_state(adapter: Any) -> dict[str, Any]:
+    if adapter is None:
+        return {"enabled": False, "connected": False, "ready": False, "qr": None}
+
+    qr_candidates = (
+        "qr",
+        "qr_code",
+        "qr_data",
+        "last_qr",
+        "latest_qr",
+        "current_qr",
+        "_qr",
+        "_last_qr",
+    )
+    state_candidates = ("connected", "ready", "authenticated", "logged_in", "is_connected")
+    nested_candidates = ("client", "bridge", "session", "state", "_client", "_bridge")
+
+    connected: bool | None = None
+    ready: bool | None = None
+    qr: str | None = None
+
+    # Direct adapter attrs
+    for name in qr_candidates:
+        if hasattr(adapter, name):
+            qr = _extract_qr_like(getattr(adapter, name))
+            if qr:
+                break
+
+    for name in state_candidates:
+        if hasattr(adapter, name):
+            raw = _maybe_call(getattr(adapter, name))
+            if isinstance(raw, bool):
+                if name in {"ready", "authenticated"}:
+                    ready = raw if ready is None else ready
+                else:
+                    connected = raw if connected is None else connected
+
+    # Nested attrs
+    for parent in nested_candidates:
+        if qr and connected is not None and ready is not None:
+            break
+        if not hasattr(adapter, parent):
+            continue
+        node = getattr(adapter, parent)
+
+        for name in qr_candidates:
+            if qr:
+                break
+            if hasattr(node, name):
+                qr = _extract_qr_like(getattr(node, name))
+                if qr:
+                    break
+
+        for name in state_candidates:
+            if hasattr(node, name):
+                raw = _maybe_call(getattr(node, name))
+                if isinstance(raw, bool):
+                    if name in {"ready", "authenticated"}:
+                        ready = raw if ready is None else ready
+                    else:
+                        connected = raw if connected is None else connected
+
+    # Reasonable fallback semantics.
+    if ready is None and connected is not None:
+        ready = connected
+    if connected is None and ready is not None:
+        connected = ready
+    if connected is None:
+        connected = False
+    if ready is None:
+        ready = False
+
+    return {
+        "enabled": True,
+        "connected": connected,
+        "ready": ready,
+        "qr": qr,
+    }
+
+
 class MeshDelegateRouter:
     def __init__(self) -> None:
         self.enabled = os.getenv("NEURALCLAW_MESH_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
@@ -280,6 +399,12 @@ async def _handle_a2a_message(request: web.Request) -> web.Response:
     return web.json_response({"content": response, "payload": {"source": "mesh"}})
 
 
+async def _handle_whatsapp_status(request: web.Request) -> web.Response:
+    adapter = request.app.get("whatsapp_adapter")
+    state = _extract_whatsapp_debug_state(adapter)
+    return web.json_response(state)
+
+
 async def _run_gateway() -> None:
     # Small startup delay so the previous container's Telegram polling
     # has time to stop before this instance starts polling.
@@ -323,10 +448,12 @@ async def _run_gateway() -> None:
         gw.add_channel(SlackAdapter(slack_bot, slack_app))
 
     whatsapp_session = get_api_key("whatsapp")
+    whatsapp_adapter: Any = None
     if whatsapp_session:
         from neuralclaw.channels.whatsapp import WhatsAppAdapter
 
-        gw.add_channel(WhatsAppAdapter(whatsapp_session))
+        whatsapp_adapter = WhatsAppAdapter(whatsapp_session)
+        gw.add_channel(whatsapp_adapter)
 
     signal_phone = get_api_key("signal")
     if signal_phone:
@@ -342,8 +469,10 @@ async def _run_gateway() -> None:
     mesh_port = int(os.getenv("NEURALCLAW_MESH_PORT", os.getenv("PORT", "8100")))
     app = web.Application()
     app["gateway"] = gw
+    app["whatsapp_adapter"] = whatsapp_adapter
     app.add_routes([
         web.get("/health", _handle_health),
+        web.get("/channels/whatsapp", _handle_whatsapp_status),
         web.post("/a2a/message", _handle_a2a_message),
     ])
     runner = web.AppRunner(app)
