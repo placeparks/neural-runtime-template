@@ -1,9 +1,8 @@
-## Stage 1: install WhatsApp bridge deps in a proper Node environment
-FROM node:20-slim AS wa-builder
+## Stage 1: install WhatsApp bridge deps using Bun (10-20x faster than npm)
+FROM oven/bun:1-slim AS wa-builder
 WORKDIR /app/wa_bridge
-RUN npm init -y \
-    && npm install --legacy-peer-deps --no-fund --no-audit --omit=optional --ignore-scripts \
-       @whiskeysockets/baileys qrcode
+RUN echo '{"name":"wa-bridge","private":true}' > package.json \
+    && bun add @whiskeysockets/baileys qrcode
 
 ## Stage 2: runtime image
 FROM python:3.12-slim
@@ -20,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy pre-built node_modules from builder — no npm install needed here
 COPY --from=wa-builder /app/wa_bridge/node_modules /app/wa_bridge/node_modules
+COPY --from=wa-builder /app/wa_bridge/package.json /app/wa_bridge/package.json
 
 WORKDIR /app
 COPY start.sh /app/start.sh
