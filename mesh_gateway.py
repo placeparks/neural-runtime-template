@@ -466,28 +466,22 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        self._restart_task: asyncio.Task[None] | None = None
+        self._stopping: bool = False
         self.qr: str | None = None
         self.connected: bool = False
         self.ready: bool = False
         self.reason: str | None = "initializing"
 
     async def start(self) -> None:
+        self._stopping = False
         _WA_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
         bridge_file = _WA_BRIDGE_DIR / "bridge.mjs"
         bridge_file.write_text(self._bridge_script(), encoding="utf-8")
-
-        self.reason = "starting_baileys_bridge"
-        self._process = await asyncio.create_subprocess_exec(
-            "node", str(bridge_file),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        self._reader_task = asyncio.create_task(self._read_messages())
-        self._stderr_task = asyncio.create_task(self._read_stderr())
-        logger.info("[WhatsApp] Baileys bridge started - session=%s", self._session_name)
+        await self._spawn_bridge(bridge_file)
 
     async def stop(self) -> None:
+        self._stopping = True
         if self._process:
             self._process.terminate()
             await self._process.wait()
@@ -503,6 +497,37 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
                 await self._stderr_task
             except asyncio.CancelledError:
                 pass
+        if self._restart_task:
+            self._restart_task.cancel()
+            try:
+                await self._restart_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _spawn_bridge(self, bridge_file: Path) -> None:
+        self.reason = "starting_baileys_bridge"
+        self._process = await asyncio.create_subprocess_exec(
+            "node", str(bridge_file),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self._reader_task = asyncio.create_task(self._read_messages())
+        self._stderr_task = asyncio.create_task(self._read_stderr())
+        logger.info("[WhatsApp] Baileys bridge started - session=%s", self._session_name)
+
+    async def _restart_after_delay(self, delay_seconds: float = 3.0) -> None:
+        if self._stopping:
+            return
+        await asyncio.sleep(delay_seconds)
+        if self._stopping:
+            return
+        try:
+            bridge_file = _WA_BRIDGE_DIR / "bridge.mjs"
+            await self._spawn_bridge(bridge_file)
+        except Exception as exc:
+            self.reason = f"restart_failed:{exc}"
+            logger.warning("[WhatsApp] bridge restart failed: %s", exc)
 
     async def send(self, channel_id: str, content: str, **kwargs: Any) -> None:
         if self._process and self._process.stdin:
@@ -561,6 +586,9 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
             self.connected = False
             self.ready = False
             self.reason = f"bridge_exited:{self._process.returncode}"
+            if not self._stopping and not self._restart_task:
+                self._restart_task = asyncio.create_task(self._restart_after_delay())
+                self._restart_task.add_done_callback(lambda _: setattr(self, "_restart_task", None))
 
     async def _read_stderr(self) -> None:
         if not self._process or not self._process.stderr:
@@ -585,7 +613,7 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
     def _bridge_script(self) -> str:
         session_dir_js = json.dumps(self._session_dir)
         return f"""
-import {{ makeWASocket, useMultiFileAuthState, DisconnectReason }} from '@whiskeysockets/baileys';
+import {{ makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers }} from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import {{ createInterface }} from 'readline';
 
@@ -593,8 +621,17 @@ const SESSION_DIR = {session_dir_js};
 
 async function main() {{
     const {{ state, saveCreds }} = await useMultiFileAuthState(SESSION_DIR);
+    const {{ version }} = await fetchLatestBaileysVersion();
     process.stdout.write(JSON.stringify({{ type: 'state', value: 'connecting' }}) + '\\n');
-    const sock = makeWASocket({{ auth: state, printQRInTerminal: false }});
+    process.stdout.write(JSON.stringify({{ type: 'state', value: `version:${{version.join('.')}}` }}) + '\\n');
+    const sock = makeWASocket({{
+        auth: state,
+        version,
+        browser: Browsers.ubuntu('Chrome'),
+        printQRInTerminal: false,
+        markOnlineOnConnect: false,
+        syncFullHistory: false,
+    }});
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -613,7 +650,12 @@ async function main() {{
         if (connection === 'close') {{
             const code = lastDisconnect?.error?.output?.statusCode;
             process.stderr.write(`connection_close code=${{code}}\\n`);
-            if (code !== DisconnectReason.loggedOut) setTimeout(main, 3000);
+            if (code === DisconnectReason.loggedOut) {{
+                process.stdout.write(JSON.stringify({{ type: 'state', value: 'logged_out' }}) + '\\n');
+                process.exit(0);
+            }}
+            process.stdout.write(JSON.stringify({{ type: 'state', value: `closed:${{code}}` }}) + '\\n');
+            process.exit(51);
         }}
     }});
 

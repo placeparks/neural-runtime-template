@@ -17,6 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Python runtime dependencies at build time (not container boot).
+RUN pip install --no-cache-dir neuralclaw aiohttp
+
 # Copy pre-built node_modules from builder — no npm install needed here
 COPY --from=wa-builder /app/wa_bridge/node_modules /app/wa_bridge/node_modules
 COPY --from=wa-builder /app/wa_bridge/package.json /app/wa_bridge/package.json

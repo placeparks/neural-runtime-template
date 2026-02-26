@@ -3,10 +3,6 @@ set -euo pipefail
 
 mkdir -p "$HOME/.neuralclaw" "$HOME/.neuralclaw/data" "$HOME/.neuralclaw/logs"
 
-# Install NeuralClaw and channel adapters at container boot.
-# Pin major/minor if you want deterministic upgrades.
-pip install "neuralclaw[all-channels]" "aiohttp"
-
 AGENT_NAME="${NEURALCLAW_AGENT_NAME:-NeuralClaw}"
 PROVIDER="${NEURALCLAW_PROVIDER:-openai}"
 MODEL="${NEURALCLAW_MODEL:-gpt-4o}"
