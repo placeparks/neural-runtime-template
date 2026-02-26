@@ -14,6 +14,9 @@ MESH_ENABLED_RAW="${NEURALCLAW_MESH_ENABLED:-false}"
 MESH_PEERS_JSON="${NEURALCLAW_MESH_PEERS_JSON:-}"
 ENABLE_DASHBOARD_RAW="${NEURALCLAW_ENABLE_DASHBOARD:-false}"
 LOCAL_URL="${NEURALCLAW_LOCAL_URL:-}"
+# Sanitize persona: replace double-quotes with single-quotes for TOML safety
+PERSONA="${NEURALCLAW_PERSONA:-You are NeuralClaw, a helpful and intelligent AI assistant.}"
+PERSONA="${PERSONA//\"/\'}"
 
 to_bool() {
   local v="${1:-false}"
@@ -50,7 +53,7 @@ fi
 cat > "$HOME/.neuralclaw/config.toml" <<EOF
 [general]
 name = "${AGENT_NAME}"
-persona = "You are NeuralClaw, a helpful and intelligent AI assistant."
+persona = "${PERSONA}"
 log_level = "INFO"
 telemetry_stdout = true
 

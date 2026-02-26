@@ -399,6 +399,192 @@ async def _handle_a2a_message(request: web.Request) -> web.Response:
     return web.json_response({"content": response, "payload": {"source": "mesh"}})
 
 
+# ---------------------------------------------------------------------------
+# QRTrackingWhatsAppAdapter — self-contained WhatsApp adapter for the runtime.
+#
+# Uses @whiskeysockets/baileys (pure JS, no Chromium/Puppeteer required).
+# Exposes .qr / .connected / .ready so _extract_whatsapp_debug_state() and
+# the /channels/whatsapp endpoint can surface them to the dashboard.
+#
+# The bridge script is written to /app/wa_bridge/bridge.mjs at startup so
+# Node ESM imports can resolve packages from /app/wa_bridge/node_modules/.
+# ---------------------------------------------------------------------------
+
+_WA_BRIDGE_DIR = Path("/app/wa_bridge")
+
+try:
+    from neuralclaw.channels.protocol import ChannelAdapter as _ChannelAdapterBase
+except Exception:
+    class _ChannelAdapterBase:  # type: ignore[no-redef]
+        def __init__(self) -> None:
+            self._handlers: list[Any] = []
+
+        def add_handler(self, handler: Any) -> None:
+            self._handlers.append(handler)
+
+        async def _dispatch(self, msg: Any) -> None:
+            for h in self._handlers:
+                try:
+                    await h(msg)
+                except Exception as exc:
+                    logging.getLogger("mesh_gateway").warning("[WhatsApp] handler error: %s", exc)
+
+        async def start(self) -> None: ...
+        async def stop(self) -> None: ...
+
+
+class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
+    """
+    WhatsApp adapter built into mesh_gateway.py.
+
+    Replaces the PyPI WhatsAppAdapter so no package republish is needed.
+    Uses @whiskeysockets/baileys instead of whatsapp-web.js — no Chromium
+    or Puppeteer, so the container stays small and boots faster.
+    """
+
+    name = "whatsapp"
+
+    def __init__(self, session_name: str = "default") -> None:
+        super().__init__()
+        self._session_name = session_name
+        self._session_dir = str(_WA_BRIDGE_DIR / f"session-{session_name}")
+        self._process: asyncio.subprocess.Process | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self.qr: str | None = None
+        self.connected: bool = False
+        self.ready: bool = False
+
+    async def start(self) -> None:
+        _WA_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
+        bridge_file = _WA_BRIDGE_DIR / "bridge.mjs"
+        bridge_file.write_text(self._bridge_script(), encoding="utf-8")
+
+        self._process = await asyncio.create_subprocess_exec(
+            "node", str(bridge_file),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self._reader_task = asyncio.create_task(self._read_messages())
+        logger.info("[WhatsApp] Baileys bridge started — scan QR from dashboard if prompted")
+
+    async def stop(self) -> None:
+        if self._process:
+            self._process.terminate()
+            await self._process.wait()
+        if self._reader_task:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                pass
+
+    async def send(self, channel_id: str, content: str, **kwargs: Any) -> None:
+        if self._process and self._process.stdin:
+            payload = json.dumps({"type": "send", "to": channel_id, "content": content})
+            self._process.stdin.write(f"{payload}\n".encode())
+            await self._process.stdin.drain()
+
+    async def _read_messages(self) -> None:
+        if not self._process or not self._process.stdout:
+            return
+        while True:
+            try:
+                line = await self._process.stdout.readline()
+                if not line:
+                    break
+                data = json.loads(line.decode().strip())
+                t = data.get("type")
+                if t == "qr":
+                    self.qr = data.get("data")
+                    self.connected = False
+                    self.ready = False
+                elif t == "ready":
+                    self.qr = None
+                    self.connected = True
+                    self.ready = True
+                elif t == "message":
+                    try:
+                        from neuralclaw.channels.protocol import ChannelMessage
+                        msg = ChannelMessage(
+                            content=data.get("content", ""),
+                            author_id=data.get("from", "unknown"),
+                            author_name=data.get("name", "Unknown"),
+                            channel_id=data.get("chat_id", ""),
+                            metadata={"platform": "whatsapp"},
+                        )
+                        await self._dispatch(msg)
+                    except Exception as exc:
+                        logger.warning("[WhatsApp] dispatch error: %s", exc)
+            except json.JSONDecodeError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("[WhatsApp] read error: %s", exc)
+                await asyncio.sleep(1)
+
+    def _bridge_script(self) -> str:
+        session_dir_js = json.dumps(self._session_dir)
+        return f"""
+import {{ makeWASocket, useMultiFileAuthState, DisconnectReason }} from '@whiskeysockets/baileys';
+import QRCode from 'qrcode';
+import {{ createInterface }} from 'readline';
+
+const SESSION_DIR = {session_dir_js};
+
+async function main() {{
+    const {{ state, saveCreds }} = await useMultiFileAuthState(SESSION_DIR);
+    const sock = makeWASocket({{ auth: state, printQRInTerminal: false }});
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async ({{ connection, qr, lastDisconnect }}) => {{
+        if (qr) {{
+            try {{
+                const dataUrl = await QRCode.toDataURL(qr);
+                process.stdout.write(JSON.stringify({{ type: 'qr', data: dataUrl }}) + '\\n');
+            }} catch {{
+                process.stdout.write(JSON.stringify({{ type: 'qr', data: qr }}) + '\\n');
+            }}
+        }}
+        if (connection === 'open') {{
+            process.stdout.write(JSON.stringify({{ type: 'ready' }}) + '\\n');
+        }}
+        if (connection === 'close') {{
+            const code = lastDisconnect?.error?.output?.statusCode;
+            if (code !== DisconnectReason.loggedOut) setTimeout(main, 3000);
+        }}
+    }});
+
+    sock.ev.on('messages.upsert', async ({{ messages }}) => {{
+        for (const msg of messages) {{
+            if (!msg.message || msg.key.fromMe) continue;
+            const body = msg.message.conversation
+                ?? msg.message.extendedTextMessage?.text
+                ?? '';
+            if (!body) continue;
+            process.stdout.write(JSON.stringify({{
+                type: 'message', content: body,
+                from: msg.key.remoteJid, name: msg.pushName || 'Unknown',
+                chat_id: msg.key.remoteJid,
+            }}) + '\\n');
+        }}
+    }});
+
+    const rl = createInterface({{ input: process.stdin }});
+    rl.on('line', async line => {{
+        try {{
+            const cmd = JSON.parse(line);
+            if (cmd.type === 'send') await sock.sendMessage(cmd.to, {{ text: cmd.content }});
+        }} catch {{}}
+    }});
+}}
+
+main().catch(e => process.stderr.write(String(e) + '\\n'));
+"""
+
+
 async def _handle_whatsapp_status(request: web.Request) -> web.Response:
     adapter = request.app.get("whatsapp_adapter")
     state = _extract_whatsapp_debug_state(adapter)
@@ -450,9 +636,7 @@ async def _run_gateway() -> None:
     whatsapp_session = get_api_key("whatsapp")
     whatsapp_adapter: Any = None
     if whatsapp_session:
-        from neuralclaw.channels.whatsapp import WhatsAppAdapter
-
-        whatsapp_adapter = WhatsAppAdapter(whatsapp_session)
+        whatsapp_adapter = QRTrackingWhatsAppAdapter(whatsapp_session)
         gw.add_channel(whatsapp_adapter)
 
     signal_phone = get_api_key("signal")
