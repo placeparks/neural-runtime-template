@@ -2,7 +2,7 @@
 FROM node:20-slim AS wa-builder
 WORKDIR /app/wa_bridge
 RUN npm init -y \
-    && npm install --legacy-peer-deps --no-fund --no-audit --omit=optional \
+    && npm install --legacy-peer-deps --no-fund --no-audit --omit=optional --ignore-scripts \
        @whiskeysockets/baileys qrcode
 
 ## Stage 2: runtime image
