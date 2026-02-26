@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -472,6 +473,7 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
         self.connected: bool = False
         self.ready: bool = False
         self.reason: str | None = "initializing"
+        self._recent_outbound: dict[str, float] = {}
 
     async def start(self) -> None:
         self._stopping = False
@@ -532,6 +534,8 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
 
     async def send(self, channel_id: str, content: str, **kwargs: Any) -> None:
         if self._process and self._process.stdin:
+            key = f"{channel_id}::{content}"
+            self._recent_outbound[key] = time.time()
             payload = json.dumps({"type": "send", "to": channel_id, "content": content})
             self._process.stdin.write(f"{payload}\n".encode())
             await self._process.stdin.drain()
@@ -564,12 +568,25 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
                         self.reason = f"state:{state}"
                 elif t == "message":
                     try:
+                        # Avoid reply loops when testing self-chat:
+                        # ignore the echo of messages sent by the bot itself.
+                        from_me = bool(data.get("from_me", False))
+                        chat_id = data.get("chat_id", "")
+                        content = data.get("content", "")
+                        key = f"{chat_id}::{content}"
+                        if from_me and key in self._recent_outbound:
+                            # Drop only recent bot echoes.
+                            ts = self._recent_outbound.get(key, 0.0)
+                            if time.time() - ts < 30:
+                                self._recent_outbound.pop(key, None)
+                                continue
+
                         from neuralclaw.channels.protocol import ChannelMessage
                         msg = ChannelMessage(
-                            content=data.get("content", ""),
+                            content=content,
                             author_id=data.get("from", "unknown"),
                             author_name=data.get("name", "Unknown"),
-                            channel_id=data.get("chat_id", ""),
+                            channel_id=chat_id,
                             metadata={"platform": "whatsapp"},
                         )
                         await self._dispatch(msg)
@@ -662,13 +679,14 @@ async function main() {{
 
     sock.ev.on('messages.upsert', async ({{ messages }}) => {{
         for (const msg of messages) {{
-            if (!msg.message || msg.key.fromMe) continue;
+            if (!msg.message) continue;
             const body = msg.message.conversation
                 ?? msg.message.extendedTextMessage?.text
                 ?? '';
             if (!body) continue;
             process.stdout.write(JSON.stringify({{
                 type: 'message', content: body,
+                from_me: Boolean(msg.key.fromMe),
                 from: msg.key.remoteJid, name: msg.pushName || 'Unknown',
                 chat_id: msg.key.remoteJid,
             }}) + '\\n');
