@@ -511,6 +511,7 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=1024 * 1024,
         )
         self._reader_task = asyncio.create_task(self._read_messages())
         self._stderr_task = asyncio.create_task(self._read_stderr())
