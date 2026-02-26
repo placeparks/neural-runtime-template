@@ -593,7 +593,7 @@ const SESSION_DIR = {session_dir_js};
 
 async function main() {{
     const {{ state, saveCreds }} = await useMultiFileAuthState(SESSION_DIR);
-    process.stdout.write(JSON.stringify({{ type: 'state', value: 'connecting' }}) + '\n');
+    process.stdout.write(JSON.stringify({{ type: 'state', value: 'connecting' }}) + '\\n');
     const sock = makeWASocket({{ auth: state, printQRInTerminal: false }});
 
     sock.ev.on('creds.update', saveCreds);
@@ -602,17 +602,17 @@ async function main() {{
         if (qr) {{
             try {{
                 const dataUrl = await QRCode.toDataURL(qr);
-                process.stdout.write(JSON.stringify({{ type: 'qr', data: dataUrl }}) + '\n');
+                process.stdout.write(JSON.stringify({{ type: 'qr', data: dataUrl }}) + '\\n');
             }} catch {{
-                process.stdout.write(JSON.stringify({{ type: 'qr', data: qr }}) + '\n');
+                process.stdout.write(JSON.stringify({{ type: 'qr', data: qr }}) + '\\n');
             }}
         }}
         if (connection === 'open') {{
-            process.stdout.write(JSON.stringify({{ type: 'ready' }}) + '\n');
+            process.stdout.write(JSON.stringify({{ type: 'ready' }}) + '\\n');
         }}
         if (connection === 'close') {{
             const code = lastDisconnect?.error?.output?.statusCode;
-            process.stderr.write(`connection_close code=${{code}}\n`);
+            process.stderr.write(`connection_close code=${{code}}\\n`);
             if (code !== DisconnectReason.loggedOut) setTimeout(main, 3000);
         }}
     }});
@@ -628,7 +628,7 @@ async function main() {{
                 type: 'message', content: body,
                 from: msg.key.remoteJid, name: msg.pushName || 'Unknown',
                 chat_id: msg.key.remoteJid,
-            }}) + '\n');
+            }}) + '\\n');
         }}
     }});
 
@@ -641,7 +641,7 @@ async function main() {{
     }});
 }}
 
-main().catch(e => process.stderr.write(`bridge_fatal ${{String(e)}}\n`));
+main().catch(e => process.stderr.write(`bridge_fatal ${{String(e)}}\\n`));
 """
 
 
