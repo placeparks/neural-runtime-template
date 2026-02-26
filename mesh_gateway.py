@@ -325,6 +325,60 @@ class MeshAwareGateway(NeuralClawGateway):
         self._mesh_router = MeshDelegateRouter()
         self._knowledge_max_chars = int(os.getenv("NEURALCLAW_KNOWLEDGE_MAX_INJECT_CHARS", "12000"))
 
+    def _get_channel_type(self, msg: Any) -> str:
+        """Override to honor metadata.source for Slack/Telegram/Discord."""
+        if msg.raw:
+            raw_module = type(msg.raw).__module__
+            if "telegram" in raw_module:
+                return "TELEGRAM"
+            if "discord" in raw_module:
+                return "DISCORD"
+            if "slack" in raw_module:
+                return "SLACK"
+
+        meta = msg.metadata or {}
+        source = str(meta.get("source", "")).lower()
+        if "telegram" in source:
+            return "TELEGRAM"
+        if "discord" in source:
+            return "DISCORD"
+        if "slack" in source:
+            return "SLACK"
+        if "whatsapp" in source:
+            return "WHATSAPP"
+        if "signal" in source:
+            return "SIGNAL"
+        if "web" in source:
+            return "CLI"
+        return "CLI"
+
+    def _get_source_adapter(self, msg: Any) -> str | None:
+        """Override to honor metadata.source for Slack/Telegram/Discord."""
+        if msg.raw:
+            raw_module = type(msg.raw).__module__
+            if "telegram" in raw_module:
+                return "telegram"
+            if "discord" in raw_module:
+                return "discord"
+            if "slack" in raw_module:
+                return "slack"
+
+        meta = msg.metadata or {}
+        source = str(meta.get("source", "")).lower()
+        if "telegram" in source:
+            return "telegram"
+        if "discord" in source:
+            return "discord"
+        if "slack" in source:
+            return "slack"
+        if "whatsapp" in source:
+            return "whatsapp"
+        if "signal" in source:
+            return "signal"
+        if "web" in source:
+            return "web"
+        return None
+
     def _is_knowledge_query(self, content: str) -> bool:
         return bool(KNOWLEDGE_QUERY_PATTERN.search(content))
 
@@ -751,6 +805,12 @@ class LocalSlackAdapter(_ChannelAdapterBase):
         async def handle_message(event: dict, say: Any) -> None:
             if event.get("bot_id") or event.get("subtype"):
                 return
+            logger.info(
+                "[Slack] inbound message event channel=%s user=%s subtype=%s",
+                event.get("channel"),
+                event.get("user"),
+                event.get("subtype"),
+            )
 
             msg = ChannelMessage(
                 content=event.get("text", ""),
@@ -765,10 +825,18 @@ class LocalSlackAdapter(_ChannelAdapterBase):
                     "thread_ts": event.get("thread_ts"),
                 },
             )
-            await adapter._dispatch(msg)
+            try:
+                await adapter._dispatch(msg)
+            except Exception:
+                logger.exception("[Slack] dispatch failure for message event")
 
         @self._app.event("app_mention")
         async def handle_mention(event: dict, say: Any) -> None:
+            logger.info(
+                "[Slack] inbound app_mention event channel=%s user=%s",
+                event.get("channel"),
+                event.get("user"),
+            )
             text = event.get("text", "")
             if "<@" in text:
                 text = text.split(">", 1)[-1].strip()
@@ -787,7 +855,10 @@ class LocalSlackAdapter(_ChannelAdapterBase):
                     "thread_ts": event.get("thread_ts", event.get("ts")),
                 },
             )
-            await adapter._dispatch(msg)
+            try:
+                await adapter._dispatch(msg)
+            except Exception:
+                logger.exception("[Slack] dispatch failure for app_mention event")
 
         self._handler = AsyncSocketModeHandler(self._app, self._app_token)
         self._task = asyncio.create_task(self._handler.start_async())
