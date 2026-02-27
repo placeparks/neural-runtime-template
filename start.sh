@@ -15,6 +15,7 @@ fi
 AGENT_NAME="${NEURALCLAW_AGENT_NAME:-NeuralClaw}"
 PROVIDER="${NEURALCLAW_PROVIDER:-openai}"
 MODEL="${NEURALCLAW_MODEL:-gpt-4o}"
+ALLOWED_TOOLS_RAW="${NEURALCLAW_ALLOWED_TOOLS:-}"
 MESH_ENABLED_RAW="${NEURALCLAW_MESH_ENABLED:-false}"
 MESH_PEERS_JSON="${NEURALCLAW_MESH_PEERS_JSON:-}"
 ENABLE_DASHBOARD_RAW="${NEURALCLAW_ENABLE_DASHBOARD:-false}"
@@ -42,6 +43,21 @@ if [[ -n "$LOCAL_URL" ]]; then
   FALLBACK_TOML='fallback = ["local"]'
 else
   FALLBACK_TOML='fallback = []'
+fi
+
+POLICY_ALLOWED_TOOLS_TOML=""
+if [[ -n "$ALLOWED_TOOLS_RAW" ]]; then
+  IFS=',' read -r -a _TOOLS_ARRAY <<< "$ALLOWED_TOOLS_RAW"
+  _TOOLS_CLEAN=()
+  for _tool in "${_TOOLS_ARRAY[@]}"; do
+    _trimmed="$(echo "$_tool" | xargs)"
+    if [[ -n "$_trimmed" ]]; then
+      _TOOLS_CLEAN+=("\"${_trimmed}\"")
+    fi
+  done
+  if [[ ${#_TOOLS_CLEAN[@]} -gt 0 ]]; then
+    POLICY_ALLOWED_TOOLS_TOML="allowed_tools = [$(IFS=,; echo "${_TOOLS_CLEAN[*]}")]"
+  fi
 fi
 
 if [[ -n "$MESH_PEERS_JSON" ]]; then
@@ -82,6 +98,10 @@ base_url = "https://openrouter.ai/api/v1"
 model = "${MODEL}"
 base_url = "${LOCAL_URL:-http://localhost:11434/v1}"
 
+[providers.g4f]
+model = "${MODEL}"
+base_url = ""
+
 [memory]
 db_path = "${HOME}/.neuralclaw/data/memory.db"
 max_episodic_results = 10
@@ -92,6 +112,9 @@ importance_threshold = 0.3
 threat_threshold = 0.7
 block_threshold = 0.9
 allow_shell_execution = false
+
+[policy]
+${POLICY_ALLOWED_TOOLS_TOML}
 
 [features]
 swarm = ${MESH_ENABLED}
