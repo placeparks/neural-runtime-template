@@ -324,6 +324,50 @@ class MeshAwareGateway(NeuralClawGateway):
         super().__init__(*args, **kwargs)
         self._mesh_router = MeshDelegateRouter()
         self._knowledge_max_chars = int(os.getenv("NEURALCLAW_KNOWLEDGE_MAX_INJECT_CHARS", "12000"))
+        self._allowed_all = self._parse_allowlist_env("NEURALCLAW_ALLOWED_SENDER_IDS")
+        self._allowed_telegram = self._parse_allowlist_env("NEURALCLAW_TELEGRAM_ALLOWED_IDS")
+        self._allowed_slack = self._parse_allowlist_env("NEURALCLAW_SLACK_ALLOWED_IDS")
+        self._allowed_whatsapp = self._parse_allowlist_env("NEURALCLAW_WHATSAPP_ALLOWED_IDS")
+        self._allowed_signal = self._parse_allowlist_env("NEURALCLAW_SIGNAL_ALLOWED_IDS")
+        self._allowed_web = self._parse_allowlist_env("NEURALCLAW_WEB_ALLOWED_IDS")
+
+    @staticmethod
+    def _parse_allowlist_env(name: str) -> set[str]:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return set()
+        return {item.strip() for item in raw.split(",") if item.strip()}
+
+    def _is_sender_allowed(self, msg: Any) -> bool:
+        sender = str(getattr(msg, "author_id", "") or "").strip()
+        if not sender:
+            return True
+
+        if self._allowed_all and sender not in self._allowed_all:
+            return False
+
+        source = (str((getattr(msg, "metadata", {}) or {}).get("source", ""))).lower()
+        if "telegram" in source and self._allowed_telegram and sender not in self._allowed_telegram:
+            return False
+        if "slack" in source and self._allowed_slack and sender not in self._allowed_slack:
+            return False
+        if "whatsapp" in source and self._allowed_whatsapp and sender not in self._allowed_whatsapp:
+            return False
+        if "signal" in source and self._allowed_signal and sender not in self._allowed_signal:
+            return False
+        if "web" in source and self._allowed_web and sender not in self._allowed_web:
+            return False
+        return True
+
+    async def _on_channel_message(self, msg: Any) -> None:
+        if not self._is_sender_allowed(msg):
+            logger.info(
+                "[runtime] sender blocked by allowlist source=%s sender=%s",
+                (msg.metadata or {}).get("source", "unknown"),
+                getattr(msg, "author_id", ""),
+            )
+            return
+        await super()._on_channel_message(msg)
 
     def _get_channel_type(self, msg: Any) -> str:
         """Override to honor metadata.source for Slack/Telegram/Discord."""
@@ -524,6 +568,7 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
         super().__init__()
         self._session_name = session_name
         self._session_dir = str(_WA_SESSION_BASE / f"session-{session_name}")
+        self._reply_mode = os.getenv("NEURALCLAW_WHATSAPP_REPLY_MODE", "direct_only").strip().lower()
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -634,6 +679,11 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
                         from_me = bool(data.get("from_me", False))
                         chat_id = data.get("chat_id", "")
                         content = data.get("content", "")
+                        # By default, do not auto-reply in WhatsApp groups.
+                        # Set NEURALCLAW_WHATSAPP_REPLY_MODE=all to reply in groups too.
+                        if self._reply_mode != "all":
+                            if not chat_id or chat_id.endswith("@g.us"):
+                                continue
                         key = f"{chat_id}::{content}"
                         if from_me and key in self._recent_outbound:
                             # Drop only recent bot echoes.
@@ -786,6 +836,7 @@ class LocalSlackAdapter(_ChannelAdapterBase):
         super().__init__()
         self._bot_token = bot_token
         self._app_token = app_token
+        self._reply_mode = os.getenv("NEURALCLAW_SLACK_REPLY_MODE", "dm_or_mention").strip().lower()
         self._app: Any = None
         self._handler: Any = None
         self._task: asyncio.Task[None] | None = None
@@ -805,6 +856,17 @@ class LocalSlackAdapter(_ChannelAdapterBase):
         async def handle_message(event: dict, say: Any) -> None:
             if event.get("bot_id") or event.get("subtype"):
                 return
+            channel_type = str(event.get("channel_type", ""))
+            text = event.get("text", "") or ""
+            in_dm = channel_type == "im"
+            addressed = "<@" in text
+            # Default behavior: respond in DMs, and in channels only when mentioned.
+            # Set NEURALCLAW_SLACK_REPLY_MODE=all to respond to every message.
+            if self._reply_mode != "all":
+                if self._reply_mode == "mention_only" and not addressed:
+                    return
+                if self._reply_mode == "dm_or_mention" and not (in_dm or addressed):
+                    return
             logger.info(
                 "[Slack] inbound message event channel=%s user=%s subtype=%s",
                 event.get("channel"),
