@@ -526,20 +526,7 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
         self._session_dir = str(_WA_SESSION_BASE / f"session-{session_name}")
         self._reply_mode = os.getenv("NEURALCLAW_WHATSAPP_REPLY_MODE", "direct_only").strip().lower()
         raw_allowed = os.getenv("NEURALCLAW_WHATSAPP_ALLOWED_IDS", "").strip()
-        self._allowed_ids: set[str] = set()
-        if raw_allowed:
-            for item in raw_allowed.split(","):
-                token = item.strip().lower()
-                if not token:
-                    continue
-                self._allowed_ids.add(token)
-                if "@" in token:
-                    token = token.split("@", 1)[0]
-                    if token:
-                        self._allowed_ids.add(token)
-                digits = re.sub(r"\D+", "", token)
-                if digits:
-                    self._allowed_ids.add(digits)
+        self._allowed_ids = {item.strip() for item in raw_allowed.split(",") if item.strip()}
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -652,22 +639,8 @@ class QRTrackingWhatsAppAdapter(_ChannelAdapterBase):
                         content = data.get("content", "")
                         sender_id = str(data.get("from", "") or "").strip()
                         # Optional strict allowlist: if set, ignore everyone else.
-                        if self._allowed_ids:
-                            sender_raw = sender_id.lower().strip()
-                            sender_base = sender_raw.split("@", 1)[0]
-                            sender_digits = re.sub(r"\D+", "", sender_base)
-                            chat_raw = str(chat_id).lower().strip()
-                            chat_base = chat_raw.split("@", 1)[0]
-                            chat_digits = re.sub(r"\D+", "", chat_base)
-                            if not (
-                                sender_raw in self._allowed_ids
-                                or sender_base in self._allowed_ids
-                                or sender_digits in self._allowed_ids
-                                or chat_raw in self._allowed_ids
-                                or chat_base in self._allowed_ids
-                                or chat_digits in self._allowed_ids
-                            ):
-                                continue
+                        if self._allowed_ids and sender_id not in self._allowed_ids:
+                            continue
                         # By default, do not auto-reply in WhatsApp groups.
                         # Set NEURALCLAW_WHATSAPP_REPLY_MODE=all to reply in groups too.
                         if self._reply_mode != "all":
