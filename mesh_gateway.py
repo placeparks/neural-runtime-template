@@ -711,68 +711,81 @@ import {{ createInterface }} from 'readline';
 const SESSION_DIR = {session_dir_js};
 
 async function main() {{
-    const {{ state, saveCreds }} = await useMultiFileAuthState(SESSION_DIR);
-    const {{ version }} = await fetchLatestBaileysVersion();
-    process.stdout.write(JSON.stringify({{ type: 'state', value: 'connecting' }}) + '\\n');
-    process.stdout.write(JSON.stringify({{ type: 'state', value: `version:${{version.join('.')}}` }}) + '\\n');
-    const sock = makeWASocket({{
-        auth: state,
-        version,
-        browser: Browsers.ubuntu('Chrome'),
-        printQRInTerminal: false,
-        markOnlineOnConnect: false,
-        syncFullHistory: false,
-    }});
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', async ({{ connection, qr, lastDisconnect }}) => {{
-        if (qr) {{
-            try {{
-                const dataUrl = await QRCode.toDataURL(qr);
-                process.stdout.write(JSON.stringify({{ type: 'qr', data: dataUrl }}) + '\\n');
-            }} catch {{
-                process.stdout.write(JSON.stringify({{ type: 'qr', data: qr }}) + '\\n');
-            }}
-        }}
-        if (connection === 'open') {{
-            process.stdout.write(JSON.stringify({{ type: 'ready' }}) + '\\n');
-        }}
-        if (connection === 'close') {{
-            const code = lastDisconnect?.error?.output?.statusCode;
-            process.stderr.write(`connection_close code=${{code}}\\n`);
-            if (code === DisconnectReason.loggedOut) {{
-                process.stdout.write(JSON.stringify({{ type: 'state', value: 'logged_out' }}) + '\\n');
-                process.exit(0);
-            }}
-            process.stdout.write(JSON.stringify({{ type: 'state', value: `closed:${{code}}` }}) + '\\n');
-            process.exit(51);
-        }}
-    }});
-
-    sock.ev.on('messages.upsert', async ({{ messages }}) => {{
-        for (const msg of messages) {{
-            if (!msg.message) continue;
-            const body = msg.message.conversation
-                ?? msg.message.extendedTextMessage?.text
-                ?? '';
-            if (!body) continue;
-            process.stdout.write(JSON.stringify({{
-                type: 'message', content: body,
-                from_me: Boolean(msg.key.fromMe),
-                from: msg.key.remoteJid, name: msg.pushName || 'Unknown',
-                chat_id: msg.key.remoteJid,
-            }}) + '\\n');
-        }}
-    }});
-
     const rl = createInterface({{ input: process.stdin }});
-    rl.on('line', async line => {{
-        try {{
-            const cmd = JSON.parse(line);
-            if (cmd.type === 'send') await sock.sendMessage(cmd.to, {{ text: cmd.content }});
-        }} catch {{}}
-    }});
+    const wait = (ms) => new Promise(res => setTimeout(res, ms));
+
+    while (true) {{
+        const {{ state, saveCreds }} = await useMultiFileAuthState(SESSION_DIR);
+        const {{ version }} = await fetchLatestBaileysVersion();
+        process.stdout.write(JSON.stringify({{ type: 'state', value: 'connecting' }}) + '\\n');
+        process.stdout.write(JSON.stringify({{ type: 'state', value: `version:${{version.join('.')}}` }}) + '\\n');
+
+        const sock = makeWASocket({{
+            auth: state,
+            version,
+            browser: Browsers.ubuntu('Chrome'),
+            printQRInTerminal: false,
+            markOnlineOnConnect: false,
+            syncFullHistory: false,
+        }});
+
+        const closed = await new Promise((resolve) => {{
+            sock.ev.on('creds.update', saveCreds);
+
+            sock.ev.on('connection.update', async ({{ connection, qr, lastDisconnect }}) => {{
+                if (qr) {{
+                    try {{
+                        const dataUrl = await QRCode.toDataURL(qr);
+                        process.stdout.write(JSON.stringify({{ type: 'qr', data: dataUrl }}) + '\\n');
+                    }} catch {{
+                        process.stdout.write(JSON.stringify({{ type: 'qr', data: qr }}) + '\\n');
+                    }}
+                }}
+                if (connection === 'open') {{
+                    process.stdout.write(JSON.stringify({{ type: 'ready' }}) + '\\n');
+                }}
+                if (connection === 'close') {{
+                    const code = lastDisconnect?.error?.output?.statusCode;
+                    process.stderr.write(`connection_close code=${{code}}\\n`);
+                    if (code === DisconnectReason.loggedOut) {{
+                        process.stdout.write(JSON.stringify({{ type: 'state', value: 'logged_out' }}) + '\\n');
+                        resolve({{ restart: false }});
+                        return;
+                    }}
+                    process.stdout.write(JSON.stringify({{ type: 'state', value: `closed:${{code}}` }}) + '\\n');
+                    resolve({{ restart: true }});
+                }}
+            }});
+
+            sock.ev.on('messages.upsert', async ({{ messages }}) => {{
+                for (const msg of messages) {{
+                    if (!msg.message) continue;
+                    const body = msg.message.conversation
+                        ?? msg.message.extendedTextMessage?.text
+                        ?? '';
+                    if (!body) continue;
+                    process.stdout.write(JSON.stringify({{
+                        type: 'message', content: body,
+                        from_me: Boolean(msg.key.fromMe),
+                        from: msg.key.remoteJid, name: msg.pushName || 'Unknown',
+                        chat_id: msg.key.remoteJid,
+                    }}) + '\\n');
+                }}
+            }});
+
+            rl.on('line', async line => {{
+                try {{
+                    const cmd = JSON.parse(line);
+                    if (cmd.type === 'send') await sock.sendMessage(cmd.to, {{ text: cmd.content }});
+                }} catch {{}}
+            }});
+        }});
+
+        if (!closed?.restart) {{
+            break;
+        }}
+        await wait(3000);
+    }}
 }}
 
 main().catch(e => process.stderr.write(`bridge_fatal ${{String(e)}}\\n`));
