@@ -535,6 +535,16 @@ async def _handle_voice_status(request: web.Request) -> web.Response:
     return await manager.handle_status(request)
 
 
+async def _handle_voice_ws(request: web.Request) -> web.WebSocketResponse:
+    """Twilio Media Streams WebSocket — bridges to OpenAI Realtime API."""
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    manager: VoiceCallManager = request.app["voice_manager"]
+    session_id = request.query.get("session_id")
+    await manager.handle_stream(ws, session_id)
+    return ws
+
+
 class VoiceCallManager:
     def __init__(self, gateway: "MeshAwareGateway") -> None:
         self._gateway = gateway
@@ -545,11 +555,29 @@ class VoiceCallManager:
         self._twilio_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
         self._twilio_number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
         self._voice_name = os.getenv("TWILIO_VOICE", "Polly.Joanna").strip() or "Polly.Joanna"
+        # OpenAI Realtime — preferred key is NEURALCLAW_VOICE_OPENAI_KEY,
+        # falls back to OPENAI_API_KEY if the agent is already using OpenAI.
+        self._realtime_key = (
+            os.getenv("NEURALCLAW_VOICE_OPENAI_KEY", "").strip()
+            or os.getenv("OPENAI_API_KEY", "").strip()
+        )
+        self._realtime_model = (
+            os.getenv("NEURALCLAW_VOICE_REALTIME_MODEL", "gpt-4o-realtime-preview").strip()
+            or "gpt-4o-realtime-preview"
+        )
+        self._realtime_voice = (
+            os.getenv("NEURALCLAW_VOICE_REALTIME_VOICE", "coral").strip() or "coral"
+        )
         self._sessions: dict[str, dict[str, Any]] = {}
 
     @property
     def enabled(self) -> bool:
         return self._enabled and self._provider == "twilio"
+
+    @property
+    def realtime_enabled(self) -> bool:
+        """True when an OpenAI key is available for the Realtime API."""
+        return self.enabled and bool(self._realtime_key)
 
     def register_tools(self) -> None:
         if not self.enabled:
@@ -715,6 +743,14 @@ class VoiceCallManager:
             except Exception:
                 pass
 
+        # --- OpenAI Realtime path (natural voice, <1s latency) ---
+        if self.realtime_enabled:
+            ws_url = f"wss://{request.host}/voice/twilio/ws?session_id={session_id}"
+            safe_url = html.escape(ws_url, quote=True)
+            logger.info("[Voice][Realtime] routing to WebSocket stream session=%s", session_id)
+            return self._xml_response(f'<Connect><Stream url="{safe_url}"/></Connect>')
+
+        # --- Fallback: Twilio Gather + LLM + Polly TTS ---
         action_url = f"https://{request.host}/voice/twilio/continue?session_id={session_id}"
         channel_id = f"voice:{state.get('call_sid', session_id)}"
         try:
@@ -821,6 +857,196 @@ class VoiceCallManager:
             return self._xml_response(f'<Say voice="{safe_voice}">{html.escape(trimmed, quote=False)}</Say><Hangup/>')
 
         return self._gather_twiml(trimmed, action_url)
+
+    # ------------------------------------------------------------------
+    # OpenAI Realtime API bridge
+    # ------------------------------------------------------------------
+
+    def _build_call_instructions(self, state: dict[str, Any]) -> str:
+        custom_persona = os.getenv("NEURALCLAW_VOICE_PERSONA", "").strip()
+        base = custom_persona or (
+            "You are a friendly, professional phone caller making an outbound call on behalf of the user."
+        )
+        return (
+            f"{base}\n\n"
+            f"Your task for this call: {state['purpose']}\n\n"
+            "Speak naturally and conversationally. Keep responses concise — 1 to 3 sentences. "
+            "Be warm and human. Do not use markdown, bullet points, or emoji. "
+            "When the task is complete or the conversation reaches a natural end, "
+            "thank the person warmly and say goodbye."
+        )
+
+    async def handle_stream(self, ws: web.WebSocketResponse, session_id: str | None) -> None:
+        """Bridge a Twilio Media Stream WebSocket to the OpenAI Realtime API."""
+        state = self._resolve_session(session_id)
+        if not state:
+            logger.warning("[Voice][Realtime] session not found: %s", session_id)
+            await ws.close()
+            return
+
+        instructions = self._build_call_instructions(state)
+        oai_url = f"wss://api.openai.com/v1/realtime?model={self._realtime_model}"
+        oai_headers = {
+            "Authorization": f"Bearer {self._realtime_key}",
+            "OpenAI-Beta": "realtime=v1",
+        }
+
+        # Shared context between the two concurrent bridge coroutines
+        ctx: dict[str, Any] = {
+            "stream_sid": None,
+            "call_sid": state.get("call_sid", session_id),
+            "transcript": [],   # list of (role, text) in chronological order
+        }
+        done = asyncio.Event()
+
+        try:
+            async with aiohttp.ClientSession() as http_sess:
+                async with http_sess.ws_connect(oai_url, headers=oai_headers) as oai_ws:
+                    await oai_ws.send_json({
+                        "type": "session.update",
+                        "session": {
+                            "turn_detection": {"type": "server_vad"},
+                            "input_audio_format": "g711_ulaw",
+                            "output_audio_format": "g711_ulaw",
+                            "voice": self._realtime_voice,
+                            "instructions": instructions,
+                            "modalities": ["text", "audio"],
+                            "temperature": 0.8,
+                            "input_audio_transcription": {"model": "whisper-1"},
+                        },
+                    })
+                    logger.info(
+                        "[Voice][Realtime] session configured model=%s voice=%s session=%s",
+                        self._realtime_model, self._realtime_voice, session_id,
+                    )
+
+                    t1 = asyncio.create_task(
+                        self._bridge_twilio_to_openai(ws, oai_ws, ctx, done)
+                    )
+                    t2 = asyncio.create_task(
+                        self._bridge_openai_to_twilio(oai_ws, ws, ctx, done, state)
+                    )
+                    await asyncio.gather(t1, t2, return_exceptions=True)
+
+        except Exception as exc:
+            logger.error("[Voice][Realtime] stream error session=%s: %s", session_id, exc)
+        finally:
+            transcript = ctx.get("transcript", [])
+            if transcript:
+                lines = ["[{}] {}".format("AI" if r == "ai" else "Callee", t) for r, t in transcript]
+                await self._relay_update(state, "Call ended.\n" + "\n".join(lines))
+            else:
+                await self._relay_update(state, "Call ended (no transcript captured).")
+            self._sessions.pop(session_id or "", None)
+
+    async def _bridge_twilio_to_openai(
+        self,
+        twilio_ws: web.WebSocketResponse,
+        oai_ws: Any,
+        ctx: dict[str, Any],
+        done: asyncio.Event,
+    ) -> None:
+        """Read Twilio Media Stream audio and forward it to OpenAI Realtime."""
+        try:
+            async for msg in twilio_ws:
+                if done.is_set():
+                    break
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    event = data.get("event")
+                    if event == "start":
+                        stream_sid = (
+                            data.get("streamSid")
+                            or data.get("start", {}).get("streamSid", "")
+                        )
+                        ctx["stream_sid"] = stream_sid
+                        call_sid = data.get("start", {}).get("callSid", "")
+                        if call_sid:
+                            ctx["call_sid"] = call_sid
+                        logger.info("[Voice][Realtime] stream started sid=%s", stream_sid)
+                    elif event == "media":
+                        payload = data.get("media", {}).get("payload", "")
+                        if payload and not oai_ws.closed:
+                            await oai_ws.send_json({
+                                "type": "input_audio_buffer.append",
+                                "audio": payload,
+                            })
+                    elif event == "stop":
+                        logger.info("[Voice][Realtime] stream stopped")
+                        done.set()
+                        break
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                    done.set()
+                    break
+        except Exception as exc:
+            logger.error("[Voice][Realtime] twilio→openai error: %s", exc)
+        finally:
+            done.set()
+            if not oai_ws.closed:
+                await oai_ws.close()
+
+    async def _bridge_openai_to_twilio(
+        self,
+        oai_ws: Any,
+        twilio_ws: web.WebSocketResponse,
+        ctx: dict[str, Any],
+        done: asyncio.Event,
+        state: dict[str, Any],
+    ) -> None:
+        """Read OpenAI Realtime events and forward audio back to Twilio."""
+        ai_buf: list[str] = []   # accumulate current AI utterance
+        try:
+            async for msg in oai_ws:
+                if done.is_set():
+                    break
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                        break
+                    continue
+
+                event = json.loads(msg.data)
+                etype = event.get("type", "")
+
+                if etype == "response.audio.delta":
+                    chunk = event.get("delta", "")
+                    if chunk and ctx.get("stream_sid") and not twilio_ws.closed:
+                        await twilio_ws.send_json({
+                            "event": "media",
+                            "streamSid": ctx["stream_sid"],
+                            "media": {"payload": chunk},
+                        })
+
+                elif etype == "response.audio_transcript.delta":
+                    ai_buf.append(event.get("delta", ""))
+
+                elif etype == "response.audio_transcript.done":
+                    text = "".join(ai_buf).strip()
+                    ai_buf.clear()
+                    if text:
+                        ctx["transcript"].append(("ai", text))
+                        await self._relay_update(state, f"[Voice] AI: {text}")
+
+                elif etype == "conversation.item.input_audio_transcription.completed":
+                    text = event.get("transcript", "").strip()
+                    if text:
+                        ctx["transcript"].append(("callee", text))
+                        await self._relay_update(state, f"[Voice] Callee: {text}")
+
+                elif etype == "input_audio_buffer.speech_started":
+                    # Callee interrupted — clear buffered audio so agent stops speaking
+                    if ctx.get("stream_sid") and not twilio_ws.closed:
+                        await twilio_ws.send_json({
+                            "event": "clear",
+                            "streamSid": ctx["stream_sid"],
+                        })
+
+                elif etype == "error":
+                    logger.error("[Voice][Realtime] OpenAI error: %s", event.get("error"))
+
+        except Exception as exc:
+            logger.error("[Voice][Realtime] openai→twilio error: %s", exc)
+        finally:
+            done.set()
 
     async def handle_status(self, request: web.Request) -> web.Response:
         session_id = request.query.get("session_id")
@@ -1365,6 +1591,7 @@ async def _run_gateway() -> None:
         web.get("/voice/twilio/continue", _handle_voice_continue),
         web.post("/voice/twilio/continue", _handle_voice_continue),
         web.post("/voice/twilio/status", _handle_voice_status),
+        web.get("/voice/twilio/ws", _handle_voice_ws),
     ])
     runner = web.AppRunner(app)
     await runner.setup()
