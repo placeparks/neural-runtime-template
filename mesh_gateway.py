@@ -43,6 +43,28 @@ except Exception as _patch_err:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# Emoji stripper — TTS engines read emoji as "hand wave sign" etc.
+# ---------------------------------------------------------------------------
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"   # emoticons
+    "\U0001F300-\U0001F5FF"   # symbols & pictographs
+    "\U0001F680-\U0001F6FF"   # transport & map
+    "\U0001F1E0-\U0001F1FF"   # flags
+    "\U00002702-\U000027B0"   # dingbats
+    "\U000024C2-\U0001F251"   # enclosed characters
+    "\U0001F900-\U0001F9FF"   # supplemental symbols
+    "\ufe0f"                   # variation selector
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _strip_emoji(text: str) -> str:
+    return _EMOJI_RE.sub("", text).strip()
+
+
+# ---------------------------------------------------------------------------
 # Knowledge base: if ~/.neuralclaw/knowledge.txt exists, enable file_ops
 # for that directory so the agent can read it with the read_file tool.
 # ---------------------------------------------------------------------------
@@ -612,6 +634,7 @@ class VoiceCallManager:
             "turns": 0,
             "retries": 0,
             "created_at": time.time(),
+            "history": [],
             "origin_channel": str(origin.get("source_channel", "")).strip(),
             "origin_channel_id": str(origin.get("channel_id", "")).strip(),
         }
@@ -693,7 +716,25 @@ class VoiceCallManager:
                 pass
 
         action_url = f"https://{request.host}/voice/twilio/continue?session_id={session_id}"
-        prompt = str(state["purpose"]).strip() or "Hello."
+        channel_id = f"voice:{state.get('call_sid', session_id)}"
+        try:
+            opening = await self._gateway.process_message(
+                content=(
+                    "You are starting an outbound phone call right now. "
+                    "Say a brief, natural greeting and immediately state the purpose of your call. "
+                    "Speak as a real person — one or two sentences, no emoji, no lists, no markdown. "
+                    f"Call purpose: {state['purpose']}"
+                ),
+                author_id="system",
+                author_name="system",
+                channel_id=channel_id,
+                channel_type_name="CLI",
+            )
+            prompt = _strip_emoji((opening or "").strip()) or "Hello, is this a good time to talk?"
+        except Exception as exc:
+            logger.error("[Voice] opening generation failed: %s", exc)
+            prompt = "Hello, is this a good time to talk?"
+        state.setdefault("history", []).append({"role": "ai", "text": prompt})
         return self._gather_twiml(prompt, action_url)
 
     async def handle_continue(self, request: web.Request) -> web.Response:
@@ -731,17 +772,26 @@ class VoiceCallManager:
 
         state["retries"] = 0
         turn_count = int(state.get("turns", 0))
-        if turn_count == 0:
-            content = (
-                "You are on a live phone call. "
-                "Speak naturally and conversationally — use short, clear sentences as a real person would in a phone conversation. "
-                "Never use bullet points, lists, markdown, or formatting of any kind. "
-                "Keep each response to two or three sentences at most. Sound warm, calm, and human. "
-                f"Your task for this call: {state['purpose']}. "
-                f"The person you called just said: {speech}"
-            )
-        else:
-            content = speech
+
+        # Build conversation history for context on every turn
+        history: list[dict] = state.setdefault("history", [])
+        history_lines = []
+        for entry in history[-8:]:  # keep last 8 exchanges to avoid token bloat
+            role = "You" if entry["role"] == "ai" else "Callee"
+            history_lines.append(f"{role}: {entry['text']}")
+        history_text = "\n".join(history_lines)
+
+        content = (
+            "You are on a live phone call. Respond naturally and conversationally. "
+            "Use short, clear sentences — 1 to 3 max per reply. "
+            "No emoji, no markdown, no bullet points. Sound warm and human. "
+            "Do not introduce yourself again if you have already done so.\n"
+            f"Call objective: {state['purpose']}\n"
+            + (f"Conversation so far:\n{history_text}\n" if history_text else "")
+            + f"Callee just said: {speech}"
+        )
+
+        history.append({"role": "callee", "text": speech})
 
         try:
             response = await self._gateway.process_message(
@@ -757,11 +807,12 @@ class VoiceCallManager:
             return self._xml_response("<Say>I hit an internal error and need to end the call. Goodbye.</Say><Hangup/>")
 
         state["turns"] = turn_count + 1
-        trimmed = (response or "").strip()
+        trimmed = _strip_emoji((response or "").strip())
         if not trimmed:
             self._sessions.pop(session_id or "", None)
             return self._xml_response("<Say>I do not have anything further to add. Goodbye.</Say><Hangup/>")
 
+        history.append({"role": "ai", "text": trimmed})
         await self._relay_update(state, f"[Voice] AI: {trimmed}")
 
         if any(term in trimmed.lower() for term in ("goodbye", "bye for now", "end the call", "hang up")):
