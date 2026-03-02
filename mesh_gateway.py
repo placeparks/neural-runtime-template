@@ -326,6 +326,7 @@ class MeshAwareGateway(NeuralClawGateway):
         self._mesh_router = MeshDelegateRouter()
         self._knowledge_max_chars = int(os.getenv("NEURALCLAW_KNOWLEDGE_MAX_INJECT_CHARS", "12000"))
         self._voice_manager: VoiceCallManager | None = None
+        self._last_request_context: dict[str, str] | None = None
 
     async def initialize(self) -> None:
         await super().initialize()
@@ -414,6 +415,24 @@ class MeshAwareGateway(NeuralClawGateway):
         channel_id: str = "cli",
         channel_type_name: str = "CLI",
     ) -> str:
+        if not channel_id.startswith("voice:"):
+            source_map = {
+                "TELEGRAM": "telegram",
+                "DISCORD": "discord",
+                "SLACK": "slack",
+                "WHATSAPP": "whatsapp",
+                "SIGNAL": "signal",
+                "WEB": "web",
+            }
+            source_channel = source_map.get(channel_type_name.upper())
+            if source_channel:
+                self._last_request_context = {
+                    "source_channel": source_channel,
+                    "channel_id": channel_id,
+                    "author_id": author_id,
+                    "author_name": author_name,
+                }
+
         parsed = self._mesh_router.parse_command(content)
         if parsed:
             target, task = parsed
@@ -585,11 +604,14 @@ class VoiceCallManager:
             return {"ok": False, "error": "phone_number and purpose are required"}
 
         session_id = f"call-{int(time.time() * 1000)}"
+        origin = getattr(self._gateway, "_last_request_context", None) or {}
         self._sessions[session_id] = {
             "purpose": objective,
             "turns": 0,
             "retries": 0,
             "created_at": time.time(),
+            "origin_channel": str(origin.get("source_channel", "")).strip(),
+            "origin_channel_id": str(origin.get("channel_id", "")).strip(),
         }
 
         payload = {
@@ -637,6 +659,21 @@ class VoiceCallManager:
             return None
         return self._sessions.get(session_id)
 
+    async def _relay_update(self, state: dict[str, Any], text: str) -> None:
+        source_channel = str(state.get("origin_channel", "")).strip()
+        channel_id = str(state.get("origin_channel_id", "")).strip()
+        if not source_channel or not channel_id:
+            return
+
+        adapter = self._gateway._channels.get(source_channel)
+        if not adapter:
+            return
+
+        try:
+            await adapter.send(channel_id, text)
+        except Exception as exc:
+            logger.warning("[Voice] relay send failed: %s", exc)
+
     async def handle_start(self, request: web.Request) -> web.Response:
         if not self.enabled:
             return self._xml_response("<Say>Voice agent is not enabled.</Say><Hangup/>")
@@ -665,11 +702,7 @@ class VoiceCallManager:
                 pass
 
         action_url = f"{request.scheme}://{request.host}/voice/twilio/continue?session_id={session_id}"
-        prompt = (
-            f"Hello. This is {self._gateway._config.name}, an AI calling assistant. "
-            f"I am calling on behalf of my user. {state['purpose']}. "
-            "Please tell me how you would like to respond after the tone."
-        )
+        prompt = str(state["purpose"]).strip() or "Hello."
         return self._gather_twiml(prompt, action_url)
 
     async def handle_continue(self, request: web.Request) -> web.Response:
@@ -697,6 +730,8 @@ class VoiceCallManager:
                 self._sessions.pop(session_id or "", None)
                 return self._xml_response("<Say>I could not hear a response. I will end the call now. Goodbye.</Say><Hangup/>")
             return self._gather_twiml("I did not catch that. Please say that again.", action_url)
+
+        await self._relay_update(state, f"[Voice] Callee: {speech}")
 
         state["retries"] = 0
         turn_count = int(state.get("turns", 0))
@@ -726,6 +761,8 @@ class VoiceCallManager:
         if not trimmed:
             self._sessions.pop(session_id or "", None)
             return self._xml_response("<Say>I do not have anything further to add. Goodbye.</Say><Hangup/>")
+
+        await self._relay_update(state, f"[Voice] AI: {trimmed}")
 
         if any(term in trimmed.lower() for term in ("goodbye", "bye for now", "end the call", "hang up")):
             self._sessions.pop(session_id or "", None)
