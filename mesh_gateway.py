@@ -599,6 +599,8 @@ class VoiceCallManager:
             "Method": "POST",
             "StatusCallback": f"{base_url}/voice/twilio/status?session_id={session_id}",
             "StatusCallbackMethod": "POST",
+            "MachineDetection": "Enable",
+            "MachineDetectionTimeout": "8",
         }
 
         try:
@@ -648,8 +650,17 @@ class VoiceCallManager:
             try:
                 form = await request.post()
                 call_sid = str(form.get("CallSid", "")).strip()
+                answered_by = str(form.get("AnsweredBy", "")).strip().lower()
                 if call_sid:
                     state["call_sid"] = call_sid
+                if answered_by:
+                    state["answered_by"] = answered_by
+                    logger.info("[Voice] session=%s answered_by=%s", session_id, answered_by)
+                    if answered_by not in {"human", "unknown"}:
+                        self._sessions.pop(session_id or "", None)
+                        return self._xml_response(
+                            "<Say>This call reached voicemail or an automated system, so I will try again later. Goodbye.</Say><Hangup/>"
+                        )
             except Exception:
                 pass
 
