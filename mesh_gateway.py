@@ -522,6 +522,7 @@ class VoiceCallManager:
         self._twilio_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
         self._twilio_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
         self._twilio_number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
+        self._voice_name = os.getenv("TWILIO_VOICE", "Polly.Joanna").strip() or "Polly.Joanna"
         self._sessions: dict[str, dict[str, Any]] = {}
 
     @property
@@ -572,9 +573,10 @@ class VoiceCallManager:
     def _gather_twiml(self, prompt: str, action_url: str) -> web.Response:
         safe_prompt = html.escape(prompt, quote=False)
         safe_action = html.escape(action_url, quote=True)
+        safe_voice = html.escape(self._voice_name, quote=True)
         return self._xml_response(
             f'<Gather input="speech" action="{safe_action}" method="POST" speechTimeout="auto" timeout="6">'
-            f'<Say voice="alice">{safe_prompt}</Say>'
+            f'<Say voice="{safe_voice}">{safe_prompt}</Say>'
             f"</Gather>"
             f'<Redirect method="POST">{safe_action}</Redirect>'
         )
@@ -729,13 +731,17 @@ class VoiceCallManager:
 
         state["retries"] = 0
         turn_count = int(state.get("turns", 0))
-        content = speech
         if turn_count == 0:
             content = (
-                "You are in a live phone call. "
-                f"Call objective from the user: {state['purpose']}. "
-                f"The callee said: {speech}"
+                "You are on a live phone call. "
+                "Speak naturally and conversationally — use short, clear sentences as a real person would in a phone conversation. "
+                "Never use bullet points, lists, markdown, or formatting of any kind. "
+                "Keep each response to two or three sentences at most. Sound warm, calm, and human. "
+                f"Your task for this call: {state['purpose']}. "
+                f"The person you called just said: {speech}"
             )
+        else:
+            content = speech
 
         try:
             response = await self._gateway.process_message(
@@ -760,7 +766,8 @@ class VoiceCallManager:
 
         if any(term in trimmed.lower() for term in ("goodbye", "bye for now", "end the call", "hang up")):
             self._sessions.pop(session_id or "", None)
-            return self._xml_response(f"<Say>{html.escape(trimmed, quote=False)}</Say><Hangup/>")
+            safe_voice = html.escape(self._voice_name, quote=True)
+            return self._xml_response(f'<Say voice="{safe_voice}">{html.escape(trimmed, quote=False)}</Say><Hangup/>')
 
         return self._gather_twiml(trimmed, action_url)
 
