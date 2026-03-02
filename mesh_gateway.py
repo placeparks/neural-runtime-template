@@ -745,10 +745,20 @@ class VoiceCallManager:
 
         # --- OpenAI Realtime path (natural voice, <1s latency) ---
         if self.realtime_enabled:
+            # Twilio strips query parameters from WebSocket URLs, so pass
+            # session_id via <Parameter> (arrives in start.customParameters).
+            # We also keep it in the URL as a fallback.
             ws_url = f"wss://{request.host}/voice/twilio/ws?session_id={session_id}"
             safe_url = html.escape(ws_url, quote=True)
+            safe_sid = html.escape(session_id or "", quote=True)
             logger.info("[Voice][Realtime] routing to WebSocket stream session=%s", session_id)
-            return self._xml_response(f'<Connect><Stream url="{safe_url}"/></Connect>')
+            return self._xml_response(
+                f'<Connect>'
+                f'<Stream url="{safe_url}">'
+                f'<Parameter name="session_id" value="{safe_sid}"/>'
+                f'</Stream>'
+                f'</Connect>'
+            )
 
         # --- Fallback: Twilio Gather + LLM + Polly TTS ---
         action_url = f"https://{request.host}/voice/twilio/continue?session_id={session_id}"
@@ -876,13 +886,50 @@ class VoiceCallManager:
             "thank the person warmly and say goodbye."
         )
 
-    async def handle_stream(self, ws: web.WebSocketResponse, session_id: str | None) -> None:
+    async def handle_stream(self, ws: web.WebSocketResponse, url_session_id: str | None) -> None:
         """Bridge a Twilio Media Stream WebSocket to the OpenAI Realtime API."""
+        # --- Phase 1: consume the Twilio handshake events ---
+        # Twilio sends "connected" then "start" before any media.
+        # The "start" event carries callSid, streamSid, and customParameters
+        # (where we put session_id, since Twilio strips URL query params).
+        session_id = url_session_id
+        stream_sid: str | None = None
+        call_sid_from_start: str | None = None
+        try:
+            async for msg in ws:
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                data = json.loads(msg.data)
+                ev = data.get("event")
+                if ev == "connected":
+                    continue  # protocol greeting — wait for "start"
+                if ev == "start":
+                    start = data.get("start", {})
+                    stream_sid = data.get("streamSid") or start.get("streamSid")
+                    call_sid_from_start = start.get("callSid", "")
+                    # URL query param takes priority; fall back to customParameters
+                    if not session_id:
+                        session_id = start.get("customParameters", {}).get("session_id", "")
+                    break
+                logger.warning("[Voice][Realtime] unexpected pre-start event: %s", ev)
+                break
+        except Exception as exc:
+            logger.error("[Voice][Realtime] error reading start event: %s", exc)
+            return
+
+        if not session_id:
+            logger.warning("[Voice][Realtime] no session_id in URL or start customParameters")
+            await ws.close()
+            return
+
         state = self._resolve_session(session_id)
         if not state:
             logger.warning("[Voice][Realtime] session not found: %s", session_id)
             await ws.close()
             return
+
+        if call_sid_from_start and not state.get("call_sid"):
+            state["call_sid"] = call_sid_from_start
 
         instructions = self._build_call_instructions(state)
         oai_url = f"wss://api.openai.com/v1/realtime?model={self._realtime_model}"
@@ -893,8 +940,8 @@ class VoiceCallManager:
 
         # Shared context between the two concurrent bridge coroutines
         ctx: dict[str, Any] = {
-            "stream_sid": None,
-            "call_sid": state.get("call_sid", session_id),
+            "stream_sid": stream_sid,
+            "call_sid": call_sid_from_start or state.get("call_sid", session_id),
             "transcript": [],   # list of (role, text) in chronological order
         }
         done = asyncio.Event()
@@ -946,7 +993,8 @@ class VoiceCallManager:
         ctx: dict[str, Any],
         done: asyncio.Event,
     ) -> None:
-        """Read Twilio Media Stream audio and forward it to OpenAI Realtime."""
+        """Read Twilio Media Stream audio and forward it to OpenAI Realtime.
+        The start event has already been consumed by handle_stream."""
         try:
             async for msg in twilio_ws:
                 if done.is_set():
@@ -954,17 +1002,7 @@ class VoiceCallManager:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
                     event = data.get("event")
-                    if event == "start":
-                        stream_sid = (
-                            data.get("streamSid")
-                            or data.get("start", {}).get("streamSid", "")
-                        )
-                        ctx["stream_sid"] = stream_sid
-                        call_sid = data.get("start", {}).get("callSid", "")
-                        if call_sid:
-                            ctx["call_sid"] = call_sid
-                        logger.info("[Voice][Realtime] stream started sid=%s", stream_sid)
-                    elif event == "media":
+                    if event == "media":
                         payload = data.get("media", {}).get("payload", "")
                         if payload and not oai_ws.closed:
                             await oai_ws.send_json({
