@@ -690,7 +690,7 @@ class VoiceCallManager:
             except Exception:
                 pass
 
-        action_url = f"{request.scheme}://{request.host}/voice/twilio/continue?session_id={session_id}"
+        action_url = f"https://{request.host}/voice/twilio/continue?session_id={session_id}"
         prompt = str(state["purpose"]).strip() or "Hello."
         return self._gather_twiml(prompt, action_url)
 
@@ -703,14 +703,19 @@ class VoiceCallManager:
         if not state:
             return self._xml_response("<Say>Call session was not found.</Say><Hangup/>")
 
-        form = await request.post()
-        speech = str(form.get("SpeechResult", "")).strip()
-        call_sid = str(form.get("CallSid", "")).strip()
-        caller = str(form.get("From", "callee")).strip() or "callee"
+        # Twilio may send GET (after an http→https redirect converts POST→GET)
+        # or POST directly. Read params from whichever is present.
+        if request.method == "POST":
+            params = await request.post()
+        else:
+            params = request.rel_url.query
+        speech = str(params.get("SpeechResult", "")).strip()
+        call_sid = str(params.get("CallSid", "")).strip()
+        caller = str(params.get("From", "callee")).strip() or "callee"
         if call_sid:
             state["call_sid"] = call_sid
 
-        action_url = f"{request.scheme}://{request.host}/voice/twilio/continue?session_id={session_id}"
+        action_url = f"https://{request.host}/voice/twilio/continue?session_id={session_id}"
 
         if not speech:
             retries = int(state.get("retries", 0)) + 1
@@ -1281,6 +1286,7 @@ async def _run_gateway() -> None:
         web.post("/a2a/message", _handle_a2a_message),
         web.get("/voice/twilio/start", _handle_voice_start),
         web.post("/voice/twilio/start", _handle_voice_start),
+        web.get("/voice/twilio/continue", _handle_voice_continue),
         web.post("/voice/twilio/continue", _handle_voice_continue),
         web.post("/voice/twilio/status", _handle_voice_status),
     ])
