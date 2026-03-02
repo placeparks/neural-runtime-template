@@ -1181,6 +1181,9 @@ async def _run_gateway() -> None:
         await asyncio.sleep(startup_delay)
 
     config = load_config()
+    if os.getenv("NEURALCLAW_VOICE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}:
+        if "place_call" not in config.policy.allowed_tools:
+            config.policy.allowed_tools.append("place_call")
 
     # Inject knowledge base hint into persona so the LLM knows to use read_file
     if _KNOWLEDGE_PATH.exists():
