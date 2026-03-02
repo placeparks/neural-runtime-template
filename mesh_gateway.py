@@ -1285,6 +1285,24 @@ async def _run_gateway() -> None:
         if "place_call" not in config.policy.allowed_tools:
             config.policy.allowed_tools.append("place_call")
 
+        # Inject voice call behaviour into the system prompt so it overrides
+        # the base persona when the LLM is on a phone call.
+        custom_voice_persona = os.getenv("NEURALCLAW_VOICE_PERSONA", "").strip()
+        if custom_voice_persona:
+            voice_hint = (
+                f"\n\nFor outbound phone calls (messages that contain 'Call objective:'): "
+                f"{custom_voice_persona} "
+                "Respond in 1-3 short sentences. No emoji or markdown."
+            )
+        else:
+            voice_hint = (
+                "\n\nFor outbound phone calls (messages that contain 'Call objective:'): "
+                "act as a focused, professional caller completing the stated task. "
+                "Do not use your usual greeting or ask 'How can I help?'. "
+                "Speak naturally in 1-3 short sentences. No emoji or markdown."
+            )
+        config.persona = (config.persona or "") + voice_hint
+
     # Inject knowledge base hint into persona so the LLM knows to use read_file
     if _KNOWLEDGE_PATH.exists():
         knowledge_hint = (
