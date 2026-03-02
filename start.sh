@@ -20,6 +20,12 @@ MESH_ENABLED_RAW="${NEURALCLAW_MESH_ENABLED:-false}"
 MESH_PEERS_JSON="${NEURALCLAW_MESH_PEERS_JSON:-}"
 ENABLE_DASHBOARD_RAW="${NEURALCLAW_ENABLE_DASHBOARD:-false}"
 LOCAL_URL="${NEURALCLAW_LOCAL_URL:-}"
+VOICE_ENABLED_RAW="${NEURALCLAW_VOICE_ENABLED:-false}"
+VOICE_PROVIDER="${NEURALCLAW_VOICE_PROVIDER:-twilio}"
+VOICE_REQUIRE_CONFIRM_RAW="${NEURALCLAW_VOICE_REQUIRE_CONFIRM:-true}"
+TWILIO_ACCOUNT_SID="${TWILIO_ACCOUNT_SID:-}"
+TWILIO_AUTH_TOKEN="${TWILIO_AUTH_TOKEN:-}"
+TWILIO_PHONE_NUMBER="${TWILIO_PHONE_NUMBER:-}"
 # Sanitize persona: replace double-quotes with single-quotes for TOML safety
 PERSONA="${NEURALCLAW_PERSONA:-You are NeuralClaw, a helpful and intelligent AI assistant.}"
 PERSONA="${PERSONA//\"/\'}"
@@ -37,6 +43,8 @@ to_bool() {
 
 MESH_ENABLED="$(to_bool "$MESH_ENABLED_RAW")"
 ENABLE_DASHBOARD="$(to_bool "$ENABLE_DASHBOARD_RAW")"
+VOICE_ENABLED="$(to_bool "$VOICE_ENABLED_RAW")"
+VOICE_REQUIRE_CONFIRM="$(to_bool "$VOICE_REQUIRE_CONFIRM_RAW")"
 
 # Build the fallback list: only include "local" if an Ollama URL is explicitly provided.
 if [[ -n "$LOCAL_URL" ]]; then
@@ -115,6 +123,14 @@ allow_shell_execution = false
 
 [policy]
 ${POLICY_ALLOWED_TOOLS_TOML}
+
+[voice]
+enabled = ${VOICE_ENABLED}
+provider = "${VOICE_PROVIDER}"
+require_confirmation = ${VOICE_REQUIRE_CONFIRM}
+twilio_account_sid = "${TWILIO_ACCOUNT_SID}"
+twilio_auth_token = "${TWILIO_AUTH_TOKEN}"
+twilio_phone_number = "${TWILIO_PHONE_NUMBER}"
 
 [features]
 swarm = ${MESH_ENABLED}

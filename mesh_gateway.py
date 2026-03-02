@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -324,6 +325,12 @@ class MeshAwareGateway(NeuralClawGateway):
         super().__init__(*args, **kwargs)
         self._mesh_router = MeshDelegateRouter()
         self._knowledge_max_chars = int(os.getenv("NEURALCLAW_KNOWLEDGE_MAX_INJECT_CHARS", "12000"))
+        self._voice_manager: VoiceCallManager | None = None
+
+    async def initialize(self) -> None:
+        await super().initialize()
+        if self._voice_manager:
+            self._voice_manager.register_tools()
 
     def _get_channel_type(self, msg: Any) -> str:
         """Override to honor metadata.source for Slack/Telegram/Discord."""
@@ -470,6 +477,259 @@ async def _handle_a2a_message(request: web.Request) -> web.Response:
         channel_type_name="CLI",
     )
     return web.json_response({"content": response, "payload": {"source": "mesh"}})
+
+
+async def _handle_voice_start(request: web.Request) -> web.Response:
+    manager: VoiceCallManager = request.app["voice_manager"]
+    return await manager.handle_start(request)
+
+
+async def _handle_voice_continue(request: web.Request) -> web.Response:
+    manager: VoiceCallManager = request.app["voice_manager"]
+    return await manager.handle_continue(request)
+
+
+async def _handle_voice_status(request: web.Request) -> web.Response:
+    manager: VoiceCallManager = request.app["voice_manager"]
+    return await manager.handle_status(request)
+
+
+class VoiceCallManager:
+    def __init__(self, gateway: "MeshAwareGateway") -> None:
+        self._gateway = gateway
+        self._enabled = os.getenv("NEURALCLAW_VOICE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        self._provider = os.getenv("NEURALCLAW_VOICE_PROVIDER", "twilio").strip().lower()
+        self._require_confirmation = os.getenv("NEURALCLAW_VOICE_REQUIRE_CONFIRM", "true").lower() in {"1", "true", "yes", "on"}
+        self._twilio_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+        self._twilio_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+        self._twilio_number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
+        self._sessions: dict[str, dict[str, Any]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled and self._provider == "twilio"
+
+    def register_tools(self) -> None:
+        if not self.enabled:
+            return
+        self._gateway._skills.register_tool(
+            name="place_call",
+            description=(
+                "Place a live outbound phone call through Twilio, speak to the callee, "
+                "listen to their spoken replies, and continue the conversation."
+            ),
+            function=self.place_call,
+            parameters={
+                "phone_number": {
+                    "type": "string",
+                    "description": "Destination phone number in E.164 format, e.g. +15551234567",
+                },
+                "purpose": {
+                    "type": "string",
+                    "description": "What the call is about and what you should handle on the user's behalf",
+                },
+            },
+        )
+        logger.info("[Voice] Twilio voice tool registered")
+
+    def _public_base_url(self) -> str | None:
+        explicit = os.getenv("NEURALCLAW_PUBLIC_BASE_URL", "").strip().rstrip("/")
+        if explicit:
+            return explicit
+        railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+        if railway_domain:
+            return f"https://{railway_domain}".rstrip("/")
+        railway_static = os.getenv("RAILWAY_STATIC_URL", "").strip()
+        if railway_static:
+            return f"https://{railway_static}".rstrip("/")
+        return None
+
+    def _xml_response(self, body: str) -> web.Response:
+        return web.Response(
+            text=f'<?xml version="1.0" encoding="UTF-8"?><Response>{body}</Response>',
+            content_type="text/xml",
+        )
+
+    def _gather_twiml(self, prompt: str, action_url: str) -> web.Response:
+        safe_prompt = html.escape(prompt, quote=False)
+        safe_action = html.escape(action_url, quote=True)
+        return self._xml_response(
+            f'<Gather input="speech" action="{safe_action}" method="POST" speechTimeout="auto" timeout="6">'
+            f'<Say voice="alice">{safe_prompt}</Say>'
+            f"</Gather>"
+            f'<Redirect method="POST">{safe_action}</Redirect>'
+        )
+
+    def _normalize_destination(self, value: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return raw
+        if raw.startswith("+"):
+            return raw
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        return f"+{digits}" if digits else raw
+
+    async def place_call(self, phone_number: str, purpose: str) -> dict[str, Any]:
+        if not self.enabled:
+            return {"ok": False, "error": "voice agent is not enabled"}
+        if not self._twilio_sid or not self._twilio_token or not self._twilio_number:
+            return {"ok": False, "error": "twilio credentials are not configured"}
+
+        base_url = self._public_base_url()
+        if not base_url:
+            return {"ok": False, "error": "public base URL is not available; set NEURALCLAW_PUBLIC_BASE_URL or enable Railway public domain"}
+
+        destination = self._normalize_destination(phone_number)
+        objective = purpose.strip()
+        if not destination or not objective:
+            return {"ok": False, "error": "phone_number and purpose are required"}
+
+        session_id = f"call-{int(time.time() * 1000)}"
+        self._sessions[session_id] = {
+            "purpose": objective,
+            "turns": 0,
+            "retries": 0,
+            "created_at": time.time(),
+        }
+
+        payload = {
+            "To": destination,
+            "From": self._twilio_number,
+            "Url": f"{base_url}/voice/twilio/start?session_id={session_id}",
+            "Method": "POST",
+            "StatusCallback": f"{base_url}/voice/twilio/status?session_id={session_id}",
+            "StatusCallbackMethod": "POST",
+        }
+
+        try:
+            async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(self._twilio_sid, self._twilio_token)) as session:
+                async with session.post(
+                    f"https://api.twilio.com/2010-04-01/Accounts/{self._twilio_sid}/Calls.json",
+                    data=payload,
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    if resp.status not in {200, 201}:
+                        return {"ok": False, "error": data.get("message", f"twilio call create failed ({resp.status})")}
+        except Exception as exc:
+            return {"ok": False, "error": f"twilio request failed: {exc}"}
+
+        call_sid = str(data.get("sid", "")).strip()
+        if call_sid:
+            self._sessions[session_id]["call_sid"] = call_sid
+
+        logger.info("[Voice] outbound call started session=%s call_sid=%s to=%s", session_id, call_sid or "unknown", destination)
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "call_sid": call_sid,
+            "status": data.get("status", "queued"),
+            "to": destination,
+            "message": (
+                f"Outbound AI call started to {destination}."
+                + (" Confirmation mode is configured for audit only." if self._require_confirmation else "")
+            ),
+        }
+
+    def _resolve_session(self, session_id: str | None) -> dict[str, Any] | None:
+        if not session_id:
+            return None
+        return self._sessions.get(session_id)
+
+    async def handle_start(self, request: web.Request) -> web.Response:
+        if not self.enabled:
+            return self._xml_response("<Say>Voice agent is not enabled.</Say><Hangup/>")
+
+        session_id = request.query.get("session_id")
+        state = self._resolve_session(session_id)
+        if not state:
+            return self._xml_response("<Say>Call session was not found.</Say><Hangup/>")
+
+        if request.method == "POST":
+            try:
+                form = await request.post()
+                call_sid = str(form.get("CallSid", "")).strip()
+                if call_sid:
+                    state["call_sid"] = call_sid
+            except Exception:
+                pass
+
+        action_url = f"{request.scheme}://{request.host}/voice/twilio/continue?session_id={session_id}"
+        prompt = (
+            f"Hello. This is {self._gateway._config.name}, an AI calling assistant. "
+            f"I am calling on behalf of my user. {state['purpose']}. "
+            "Please tell me how you would like to respond after the tone."
+        )
+        return self._gather_twiml(prompt, action_url)
+
+    async def handle_continue(self, request: web.Request) -> web.Response:
+        if not self.enabled:
+            return self._xml_response("<Say>Voice agent is not enabled.</Say><Hangup/>")
+
+        session_id = request.query.get("session_id")
+        state = self._resolve_session(session_id)
+        if not state:
+            return self._xml_response("<Say>Call session was not found.</Say><Hangup/>")
+
+        form = await request.post()
+        speech = str(form.get("SpeechResult", "")).strip()
+        call_sid = str(form.get("CallSid", "")).strip()
+        caller = str(form.get("From", "callee")).strip() or "callee"
+        if call_sid:
+            state["call_sid"] = call_sid
+
+        action_url = f"{request.scheme}://{request.host}/voice/twilio/continue?session_id={session_id}"
+
+        if not speech:
+            retries = int(state.get("retries", 0)) + 1
+            state["retries"] = retries
+            if retries >= 2:
+                self._sessions.pop(session_id or "", None)
+                return self._xml_response("<Say>I could not hear a response. I will end the call now. Goodbye.</Say><Hangup/>")
+            return self._gather_twiml("I did not catch that. Please say that again.", action_url)
+
+        state["retries"] = 0
+        turn_count = int(state.get("turns", 0))
+        content = speech
+        if turn_count == 0:
+            content = (
+                "You are in a live phone call. "
+                f"Call objective from the user: {state['purpose']}. "
+                f"The callee said: {speech}"
+            )
+
+        try:
+            response = await self._gateway.process_message(
+                content=content,
+                author_id=caller,
+                author_name=caller,
+                channel_id=f"voice:{call_sid or session_id}",
+                channel_type_name="CLI",
+            )
+        except Exception as exc:
+            logger.error("[Voice] call response failed: %s", exc)
+            self._sessions.pop(session_id or "", None)
+            return self._xml_response("<Say>I hit an internal error and need to end the call. Goodbye.</Say><Hangup/>")
+
+        state["turns"] = turn_count + 1
+        trimmed = (response or "").strip()
+        if not trimmed:
+            self._sessions.pop(session_id or "", None)
+            return self._xml_response("<Say>I do not have anything further to add. Goodbye.</Say><Hangup/>")
+
+        if any(term in trimmed.lower() for term in ("goodbye", "bye for now", "end the call", "hang up")):
+            self._sessions.pop(session_id or "", None)
+            return self._xml_response(f"<Say>{html.escape(trimmed, quote=False)}</Say><Hangup/>")
+
+        return self._gather_twiml(trimmed, action_url)
+
+    async def handle_status(self, request: web.Request) -> web.Response:
+        session_id = request.query.get("session_id")
+        if session_id:
+            form = await request.post()
+            call_state = str(form.get("CallStatus", "")).strip().lower()
+            if call_state in {"completed", "busy", "failed", "no-answer", "canceled"}:
+                self._sessions.pop(session_id, None)
+        return web.Response(status=204)
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +1192,8 @@ async def _run_gateway() -> None:
         config.persona = (config.persona or "") + knowledge_hint
 
     gw = MeshAwareGateway(config)
+    voice_manager = VoiceCallManager(gw)
+    gw._voice_manager = voice_manager
 
     for ch_config in config.channels:
         if not ch_config.enabled or not ch_config.token:
@@ -972,10 +1234,15 @@ async def _run_gateway() -> None:
     app = web.Application()
     app["gateway"] = gw
     app["whatsapp_adapter"] = whatsapp_adapter
+    app["voice_manager"] = voice_manager
     app.add_routes([
         web.get("/health", _handle_health),
         web.get("/channels/whatsapp", _handle_whatsapp_status),
         web.post("/a2a/message", _handle_a2a_message),
+        web.get("/voice/twilio/start", _handle_voice_start),
+        web.post("/voice/twilio/start", _handle_voice_start),
+        web.post("/voice/twilio/continue", _handle_voice_continue),
+        web.post("/voice/twilio/status", _handle_voice_status),
     ])
     runner = web.AppRunner(app)
     await runner.setup()
