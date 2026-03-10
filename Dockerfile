@@ -15,10 +15,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     bash \
     nodejs \
+    gcc \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python runtime dependencies at build time (not container boot).
-RUN pip install --no-cache-dir neuralclaw aiohttp
+# Pinned to 0.5.3 — bump deliberately when the runtime template is re-validated.
+RUN pip install --no-cache-dir "neuralclaw==0.5.3" aiohttp
 
 # Copy pre-built node_modules from builder — no npm install needed here
 COPY --from=wa-builder /app/wa_bridge/node_modules /app/wa_bridge/node_modules

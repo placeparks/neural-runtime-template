@@ -20,29 +20,6 @@ from neuralclaw.config import get_api_key, load_config
 from neuralclaw.gateway import NeuralClawGateway
 
 # ---------------------------------------------------------------------------
-# Hotfix: ToolCall.to_dict() must serialise arguments as a JSON *string*.
-# OpenAI rejects tool_calls where function.arguments is a plain dict.
-# Remove this block once neuralclaw >= next release is on PyPI.
-# ---------------------------------------------------------------------------
-try:
-    from neuralclaw.providers.router import ToolCall as _ToolCall
-
-    def _patched_to_dict(self: _ToolCall) -> dict:  # type: ignore[override]
-        return {
-            "id": self.id,
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "arguments": json.dumps(self.arguments),
-            },
-        }
-
-    _ToolCall.to_dict = _patched_to_dict  # type: ignore[method-assign]
-except Exception as _patch_err:  # pragma: no cover
-    logging.getLogger("mesh_gateway").warning("Could not apply ToolCall patch: %s", _patch_err)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Emoji stripper — TTS engines read emoji as "hand wave sign" etc.
 # ---------------------------------------------------------------------------
 _EMOJI_RE = re.compile(

@@ -15,10 +15,14 @@ fi
 AGENT_NAME="${NEURALCLAW_AGENT_NAME:-NeuralClaw}"
 PROVIDER="${NEURALCLAW_PROVIDER:-openai}"
 MODEL="${NEURALCLAW_MODEL:-gpt-4o}"
+PROXY_BASE_URL="${NEURALCLAW_PROXY_BASE_URL:-}"
+PROXY_API_KEY="${NEURALCLAW_PROXY_API_KEY:-}"
 ALLOWED_TOOLS_RAW="${NEURALCLAW_ALLOWED_TOOLS:-}"
 MESH_ENABLED_RAW="${NEURALCLAW_MESH_ENABLED:-false}"
 MESH_PEERS_JSON="${NEURALCLAW_MESH_PEERS_JSON:-}"
 ENABLE_DASHBOARD_RAW="${NEURALCLAW_ENABLE_DASHBOARD:-false}"
+ENABLE_EVOLUTION_RAW="${NEURALCLAW_ENABLE_EVOLUTION:-false}"
+ENABLE_REFLECTIVE_RAW="${NEURALCLAW_REFLECTIVE_REASONING:-true}"
 LOCAL_URL="${NEURALCLAW_LOCAL_URL:-}"
 VOICE_ENABLED_RAW="${NEURALCLAW_VOICE_ENABLED:-false}"
 VOICE_PROVIDER="${NEURALCLAW_VOICE_PROVIDER:-twilio}"
@@ -41,10 +45,35 @@ to_bool() {
   shopt -u nocasematch
 }
 
+# Normalize session providers → proxy provider
+SESSION_PROVIDER=""
+if [[ "$PROVIDER" == "chatgpt_session" ]]; then
+  SESSION_PROVIDER="chatgpt"
+  PROVIDER="proxy"
+elif [[ "$PROVIDER" == "claude_session" ]]; then
+  SESSION_PROVIDER="claude"
+  PROVIDER="proxy"
+fi
+# If SESSION_PROVIDER env was set explicitly (by provisioner), respect it
+if [[ -n "${NEURALCLAW_SESSION_PROVIDER:-}" && -z "$SESSION_PROVIDER" ]]; then
+  SESSION_PROVIDER="${NEURALCLAW_SESSION_PROVIDER}"
+fi
+
 MESH_ENABLED="$(to_bool "$MESH_ENABLED_RAW")"
 ENABLE_DASHBOARD="$(to_bool "$ENABLE_DASHBOARD_RAW")"
+ENABLE_EVOLUTION="$(to_bool "$ENABLE_EVOLUTION_RAW")"
+ENABLE_REFLECTIVE="$(to_bool "$ENABLE_REFLECTIVE_RAW")"
 VOICE_ENABLED="$(to_bool "$VOICE_ENABLED_RAW")"
 VOICE_REQUIRE_CONFIRM="$(to_bool "$VOICE_REQUIRE_CONFIRM_RAW")"
+
+# Resolve proxy model: session providers have a canonical default; otherwise use $MODEL.
+if [[ "$SESSION_PROVIDER" == "chatgpt" ]]; then
+  PROXY_MODEL="${MODEL:-gpt-4o}"
+elif [[ "$SESSION_PROVIDER" == "claude" ]]; then
+  PROXY_MODEL="${MODEL:-claude-sonnet-4-20250514}"
+else
+  PROXY_MODEL="${MODEL}"
+fi
 
 # Build the fallback list: only include "local" if an Ollama URL is explicitly provided.
 if [[ -n "$LOCAL_URL" ]]; then
@@ -110,6 +139,10 @@ base_url = "${LOCAL_URL:-http://localhost:11434/v1}"
 model = "${MODEL}"
 base_url = ""
 
+[providers.proxy]
+model = "${PROXY_MODEL}"
+base_url = "${PROXY_BASE_URL}"
+
 [memory]
 db_path = "${HOME}/.neuralclaw/data/memory.db"
 max_episodic_results = 10
@@ -119,10 +152,21 @@ importance_threshold = 0.3
 [security]
 threat_threshold = 0.7
 block_threshold = 0.9
+threat_verifier_model = ""
+threat_borderline_low = 0.35
+threat_borderline_high = 0.65
+max_content_chars = 8000
+max_skill_timeout_seconds = 30
 allow_shell_execution = false
 
 [policy]
+max_tool_calls_per_request = 10
+max_request_wall_seconds = 120.0
 ${POLICY_ALLOWED_TOOLS_TOML}
+mutating_tools = ["write_file", "create_event", "delete_event"]
+allowed_filesystem_roots = ["${HOME}/.neuralclaw"]
+deny_private_networks = true
+deny_shell_execution = true
 
 [voice]
 enabled = ${VOICE_ENABLED}
@@ -135,10 +179,13 @@ twilio_phone_number = "${TWILIO_PHONE_NUMBER}"
 [features]
 swarm = ${MESH_ENABLED}
 dashboard = ${ENABLE_DASHBOARD}
-evolution = false
-reflective_reasoning = true
+evolution = ${ENABLE_EVOLUTION}
+reflective_reasoning = ${ENABLE_REFLECTIVE}
 procedural_memory = true
 semantic_memory = true
+
+[federation]
+enabled = false
 
 [channels.telegram]
 enabled = true
