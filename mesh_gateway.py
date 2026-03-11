@@ -16,6 +16,7 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
+from neuralclaw.bus.neural_bus import EventType
 from neuralclaw.cortex.action.policy import RequestContext
 from neuralclaw.cortex.reasoning.deliberate import ConfidenceEnvelope, DeliberativeReasoner
 from neuralclaw.config import get_api_key, load_config
@@ -51,6 +52,85 @@ _SEARCH_QUERY_RE = re.compile(
 
 def _looks_like_web_search_query(text: str) -> bool:
     return bool(_SEARCH_QUERY_RE.search(text or ""))
+
+
+async def _openai_web_search(query: str) -> dict[str, Any]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    provider = os.getenv("NEURALCLAW_PROVIDER", "").strip().lower()
+    base_url = os.getenv("NEURALCLAW_OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+    model = os.getenv("NEURALCLAW_MODEL", "gpt-4o").strip() or "gpt-4o"
+
+    if not api_key:
+        return {"error": "OPENAI_API_KEY is not configured for provider-backed search fallback."}
+    if provider != "openai":
+        return {"error": f"Provider-backed search fallback is only enabled for OpenAI; current provider is '{provider or 'unknown'}'."}
+    if base_url != "https://api.openai.com/v1":
+        return {"error": f"Provider-backed search fallback requires the default OpenAI base URL; current base URL is '{base_url}'."}
+
+    payload = {
+        "model": model,
+        "tools": [{"type": "web_search"}],
+        "tool_choice": "auto",
+        "include": ["web_search_call.action.sources"],
+        "input": query,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(
+                "https://api.openai.com/v1/responses",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=45),
+            ) as resp:
+                raw_text = await resp.text()
+                if resp.status != 200:
+                    return {"error": f"OpenAI web search failed ({resp.status}): {raw_text[:300]}"}
+        data = json.loads(raw_text)
+    except Exception as exc:
+        return {"error": f"OpenAI web search request failed: {exc}"}
+
+    output_text = str(data.get("output_text") or "").strip()
+    results: list[dict[str, str]] = []
+    sources: list[dict[str, str]] = []
+
+    for item in data.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") not in ("output_text", "text"):
+                continue
+            text_value = str(content.get("text") or "").strip()
+            if text_value and not output_text:
+                output_text = text_value
+            for ann in content.get("annotations", []):
+                if ann.get("type") != "url_citation":
+                    continue
+                url = str(ann.get("url") or "").strip()
+                title = str(ann.get("title") or url or "Source").strip()
+                if url:
+                    sources.append({"title": title, "url": url})
+
+    for source in sources[:5]:
+        results.append({
+            "title": source["title"],
+            "snippet": output_text[:500] if output_text else source["title"],
+            "url": source["url"],
+        })
+
+    if not output_text and not results:
+        return {"error": "OpenAI web search returned no usable output."}
+
+    return {
+        "query": query,
+        "provider": "openai_web_search",
+        "summary": output_text,
+        "results": results,
+        "sources": sources,
+    }
 
 
 async def _patched_web_search(query: str, max_results: int = 5) -> dict[str, Any]:
@@ -129,15 +209,29 @@ async def _patched_web_search(query: str, max_results: int = 5) -> dict[str, Any
             }
 
         if resp.status == 202:
+            openai_fallback = await _openai_web_search(query)
+            if not openai_fallback.get("error"):
+                return openai_fallback
             return {
                 "query": query,
                 "results": [],
                 "warning": "Search provider returned 202 Accepted with no usable results. Try a broader query.",
+                "fallback_error": openai_fallback.get("error"),
             }
 
-        return {"message": f"No results found for '{query}'", "results": []}
+        openai_fallback = await _openai_web_search(query)
+        if not openai_fallback.get("error"):
+            return openai_fallback
+        return {
+            "message": f"No results found for '{query}'",
+            "results": [],
+            "fallback_error": openai_fallback.get("error"),
+        }
     except Exception as exc:
-        return {"error": f"Search failed: {exc}"}
+        openai_fallback = await _openai_web_search(query)
+        if not openai_fallback.get("error"):
+            return openai_fallback
+        return {"error": f"Search failed: {exc}", "fallback_error": openai_fallback.get("error")}
 
 
 def _safe_status(resp: Any) -> Any:
