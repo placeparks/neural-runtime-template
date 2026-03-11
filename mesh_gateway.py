@@ -413,6 +413,8 @@ class MeshAwareGateway(NeuralClawGateway):
         author_name: str = "User",
         channel_id: str = "cli",
         channel_type_name: str = "CLI",
+        message_metadata: dict[str, Any] | None = None,
+        raw_message: Any = None,
     ) -> str:
         if not channel_id.startswith("voice:"):
             source_map = {
@@ -460,6 +462,8 @@ class MeshAwareGateway(NeuralClawGateway):
             author_name=author_name,
             channel_id=channel_id,
             channel_type_name=channel_type_name,
+            message_metadata=message_metadata,
+            raw_message=raw_message,
         )
 
 
