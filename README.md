@@ -9,12 +9,14 @@ This repo is cloned by Railway for each user deployment created by your provisio
 Your provisioner should set these env vars per service:
 
 - `NEURALCLAW_AGENT_NAME`
-- `NEURALCLAW_PROVIDER` (`openai|anthropic|openrouter|local`)
+- `NEURALCLAW_PROVIDER` (`openai|anthropic|openrouter|local|g4f|chatgpt_token|claude_token`)
 - `NEURALCLAW_MODEL`
 - Provider key (one of):
   - `OPENAI_API_KEY`
   - `ANTHROPIC_API_KEY`
   - `OPENROUTER_API_KEY`
+  - `CHATGPT_TOKEN`
+  - `CLAUDE_SESSION_KEY`
 - Channel tokens (as needed):
   - `NEURALCLAW_TELEGRAM_TOKEN`
   - `NEURALCLAW_DISCORD_TOKEN`
@@ -38,9 +40,10 @@ Your provisioner should set these env vars per service:
 
 ## Notes
 
-- Uses `pip install "neuralclaw[all-channels]"` at startup.
+- Uses `neuralclaw==0.7.5`.
 - Does not run `neuralclaw init` (interactive, not suitable for automation).
 - Stores runtime config in `$HOME/.neuralclaw/config.toml`.
 - Writes mesh peers to `$HOME/.neuralclaw/mesh-peers.json` when provided.
+- Imports `CHATGPT_TOKEN` / `CLAUDE_SESSION_KEY` into NeuralClaw's token store on boot.
 - Uses `/app/mesh_gateway.py` to intercept `ask <agent> ...` and delegate over mesh HTTP.
 - Exposes `POST /a2a/message` for remote agents to send tasks.
