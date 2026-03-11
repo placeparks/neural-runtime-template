@@ -237,6 +237,7 @@ EOF
 python - <<'PY'
 import os
 import time
+import json
 
 from neuralclaw.session.auth import AuthManager, TokenCredential
 
@@ -245,14 +246,30 @@ def save_from_env(env_name: str, provider: str, token_type: str) -> None:
     value = os.getenv(env_name, "").strip()
     if not value:
         return
-    credential = TokenCredential(
-        access_token=value,
-        provider=provider,
-        token_type=token_type,
-        expires_at=time.time() + 86400 * 30,
-    )
+    credential = None
+    if value.startswith("{"):
+        try:
+            data = json.loads(value)
+            access_token = str(data.get("access_token", "")).strip()
+            if access_token:
+                credential = TokenCredential(
+                    access_token=access_token,
+                    provider=str(data.get("provider") or provider),
+                    token_type=str(data.get("token_type") or token_type),
+                    expires_at=float(data.get("expires_at") or (time.time() + 86400 * 30)),
+                    refresh_token=str(data.get("refresh_token") or ""),
+                )
+        except Exception as exc:
+            print(f"[runtime] failed to parse structured credential from {env_name}: {exc}")
+    if credential is None:
+        credential = TokenCredential(
+            access_token=value,
+            provider=provider,
+            token_type=token_type,
+            expires_at=time.time() + 86400 * 30,
+        )
     AuthManager(provider).save_credential(credential)
-    print(f"[runtime] imported {provider} credential from {env_name}")
+    print(f"[runtime] imported {provider} credential from {env_name} ({credential.token_type})")
 
 
 save_from_env("CHATGPT_TOKEN", "chatgpt", "cookie")
