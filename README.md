@@ -40,7 +40,7 @@ Your provisioner should set these env vars per service:
 
 ## Notes
 
-- Uses `neuralclaw==0.7.5`.
+- Uses exact package pin `neuralclaw==0.7.5`.
 - Does not run `neuralclaw init` (interactive, not suitable for automation).
 - Stores runtime config in `$HOME/.neuralclaw/config.toml`.
 - Writes mesh peers to `$HOME/.neuralclaw/mesh-peers.json` when provided.

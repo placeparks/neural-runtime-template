@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python runtime dependencies at build time.
-# Pinned to 0.5.3 — bump deliberately when the runtime template is re-validated.
+# Pinned to 0.7.5 for the current SaaS/runtime integration.
 RUN pip install --no-cache-dir "neuralclaw==0.7.5" aiohttp
 
 # Copy pre-built node_modules from builder — no npm install needed here
