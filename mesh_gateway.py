@@ -16,6 +16,8 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
+from neuralclaw.cortex.action.policy import RequestContext
+from neuralclaw.cortex.reasoning.deliberate import ConfidenceEnvelope, DeliberativeReasoner
 from neuralclaw.config import get_api_key, load_config
 from neuralclaw.gateway import NeuralClawGateway
 
@@ -39,6 +41,135 @@ _EMOJI_RE = re.compile(
 
 def _strip_emoji(text: str) -> str:
     return _EMOJI_RE.sub("", text).strip()
+
+
+_SEARCH_QUERY_RE = re.compile(
+    r"\b(search|find|look up|google|browse|review|reviews|latest|news|reddit|trustpilot)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_web_search_query(text: str) -> bool:
+    return bool(_SEARCH_QUERY_RE.search(text or ""))
+
+
+_ORIGINAL_DELIBERATE_REASON = DeliberativeReasoner.reason
+
+
+async def _patched_deliberative_reason(
+    self: DeliberativeReasoner,
+    signal: Any,
+    memory_ctx: Any,
+    tools: list[Any] | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> ConfidenceEnvelope:
+    if not _looks_like_web_search_query(getattr(signal, "content", "")):
+        return await _ORIGINAL_DELIBERATE_REASON(self, signal, memory_ctx, tools, conversation_history)
+
+    web_tool = next((t for t in (tools or []) if getattr(t, "name", "") == "web_search"), None)
+    if not web_tool:
+        return ConfidenceEnvelope(
+            response="Web search was requested, but this agent does not have the web_search tool enabled.",
+            confidence=0.0,
+            source="error",
+            uncertainty_factors=["web_search_unavailable"],
+        )
+
+    request_ctx = RequestContext(request_id=getattr(signal, "id", "forced-web-search"))
+
+    class _ForcedToolCall:
+        def __init__(self, signal_id: str, query: str) -> None:
+            self.id = f"forced-web-search-{signal_id}"
+            self.name = "web_search"
+            self.arguments = {"query": query, "max_results": 5}
+
+    forced_search = await self._execute_tool_call(
+        _ForcedToolCall(getattr(signal, "id", "forced"), getattr(signal, "content", "")),
+        tools or [],
+        request_ctx,
+    )
+    if isinstance(forced_search, dict) and forced_search.get("error"):
+        return ConfidenceEnvelope(
+            response=f"Web search failed: {forced_search['error']}",
+            confidence=0.0,
+            source="error",
+            uncertainty_factors=["web_search_failed"],
+        )
+
+    await self._bus.publish(
+        EventType.REASONING_STARTED,
+        {"signal_id": signal.id, "path": "deliberative", "tools_available": len(tools or [])},
+        source="reasoning.deliberate",
+    )
+
+    messages = self._build_messages(signal, memory_ctx, conversation_history)
+    messages.append({
+        "role": "system",
+        "content": (
+            "Web search was executed for this request. Base your answer on these results. "
+            "If the results are sparse or inconclusive, say that clearly instead of pretending to browse.\n\n"
+            f"WEB_SEARCH_RESULTS:\n{json.dumps(forced_search, ensure_ascii=False)}"
+        ),
+    })
+
+    tool_defs = [t.to_openai_format() for t in (tools or [])] if tools else None
+    tool_calls_made = 1
+    iterations = 0
+
+    while iterations < self.MAX_ITERATIONS:
+        iterations += 1
+        try:
+            response = await self._provider.complete(messages=messages, tools=tool_defs)
+        except Exception as e:
+            return ConfidenceEnvelope(
+                response=f"I encountered an error: {str(e)}",
+                confidence=0.0,
+                source="error",
+                uncertainty_factors=["provider_error"],
+            )
+
+        if response.tool_calls and tools:
+            for tc in response.tool_calls:
+                tool_calls_made += 1
+                result = await self._execute_tool_call(tc, tools, request_ctx)
+                messages.append({"role": "assistant", "content": None, "tool_calls": [tc.to_dict()]})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
+            continue
+
+        content = response.content or "I'm not sure how to respond to that."
+        confidence = self._estimate_confidence(content, memory_ctx, tool_calls_made)
+        source = "tool_verified" if tool_calls_made > 0 else "llm"
+        envelope = ConfidenceEnvelope(
+            response=content,
+            confidence=confidence,
+            source=source,
+            tool_calls_made=tool_calls_made,
+            uncertainty_factors=self._detect_uncertainty(content),
+        )
+
+        await self._bus.publish(
+            EventType.REASONING_COMPLETE,
+            {
+                "signal_id": signal.id,
+                "confidence": envelope.confidence,
+                "source": envelope.source,
+                "tool_calls": tool_calls_made,
+                "iterations": iterations,
+            },
+            source="reasoning.deliberate",
+        )
+        return envelope
+
+    return ConfidenceEnvelope(
+        response="I spent too many iterations trying to answer. Let me try a simpler approach â€” could you rephrase?",
+        confidence=0.1,
+        source="max_iterations",
+        uncertainty_factors=["max_iterations_reached"],
+        tool_calls_made=tool_calls_made,
+    )
+
+
+DeliberativeReasoner.reason = _patched_deliberative_reason
 
 
 # ---------------------------------------------------------------------------
