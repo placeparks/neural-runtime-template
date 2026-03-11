@@ -53,6 +53,104 @@ def _looks_like_web_search_query(text: str) -> bool:
     return bool(_SEARCH_QUERY_RE.search(text or ""))
 
 
+async def _patched_web_search(query: str, max_results: int = 5) -> dict[str, Any]:
+    from neuralclaw.cortex.action.network import validate_url
+    from neuralclaw.skills.builtins import web_search as _web_search_mod
+
+    url_check = validate_url(_web_search_mod._DUCKDUCKGO_API)
+    if not url_check.allowed:
+        return {"error": f"URL blocked by SSRF policy: {url_check.reason}"}
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
+    }
+    params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
+
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(
+                _web_search_mod._DUCKDUCKGO_API,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                raw_text = await resp.text()
+                if resp.status not in (200, 202):
+                    return {"error": f"Search failed with status {resp.status}: {raw_text[:200]}"}
+
+        try:
+            data = json.loads(raw_text or "{}")
+        except json.JSONDecodeError:
+            return {"error": f"Search returned non-JSON response (status {_safe_status(resp)})"}
+
+        results: list[dict[str, str]] = []
+        if data.get("Abstract"):
+            results.append({
+                "title": data.get("Heading", ""),
+                "snippet": data.get("Abstract", ""),
+                "url": data.get("AbstractURL", ""),
+            })
+
+        for topic in data.get("RelatedTopics", [])[: max_results * 2]:
+            if isinstance(topic, dict) and "Text" in topic:
+                topic_url = topic.get("FirstURL", "")
+                if topic_url:
+                    topic_url_check = validate_url(topic_url)
+                    if not topic_url_check.allowed:
+                        topic_url = "[blocked]"
+                results.append({
+                    "title": topic.get("Text", "")[:100],
+                    "snippet": topic.get("Text", ""),
+                    "url": topic_url,
+                })
+            elif isinstance(topic, dict) and isinstance(topic.get("Topics"), list):
+                for nested in topic["Topics"]:
+                    if isinstance(nested, dict) and "Text" in nested:
+                        topic_url = nested.get("FirstURL", "")
+                        if topic_url:
+                            topic_url_check = validate_url(topic_url)
+                            if not topic_url_check.allowed:
+                                topic_url = "[blocked]"
+                        results.append({
+                            "title": nested.get("Text", "")[:100],
+                            "snippet": nested.get("Text", ""),
+                            "url": topic_url,
+                        })
+
+        if results:
+            return {
+                "query": query,
+                "results": results[:max_results],
+                "status": "ok" if resp.status == 200 else "accepted_partial",
+            }
+
+        if resp.status == 202:
+            return {
+                "query": query,
+                "results": [],
+                "warning": "Search provider returned 202 Accepted with no usable results. Try a broader query.",
+            }
+
+        return {"message": f"No results found for '{query}'", "results": []}
+    except Exception as exc:
+        return {"error": f"Search failed: {exc}"}
+
+
+def _safe_status(resp: Any) -> Any:
+    try:
+        return resp.status
+    except Exception:
+        return "unknown"
+
+
+from neuralclaw.skills.builtins import web_search as _web_search_mod
+_web_search_mod.web_search = _patched_web_search
+
+
 _ORIGINAL_DELIBERATE_REASON = DeliberativeReasoner.reason
 
 
