@@ -9,12 +9,14 @@ This repo is cloned by Railway for each user deployment created by your provisio
 Your provisioner should set these env vars per service:
 
 - `NEURALCLAW_AGENT_NAME`
-- `NEURALCLAW_PROVIDER` (`openai|anthropic|openrouter|local|g4f|chatgpt_token|claude_token`)
+- `NEURALCLAW_PROVIDER` (`openai|anthropic|openrouter|venice|local|g4f|chatgpt_token|claude_token`)
 - `NEURALCLAW_MODEL`
 - Provider key (one of):
   - `OPENAI_API_KEY`
   - `ANTHROPIC_API_KEY`
   - `OPENROUTER_API_KEY`
+  - `OPENAI_API_KEY` with `NEURALCLAW_PROVIDER=venice` for Venice API
+  - `NEURALCLAW_OPENAI_BASE_URL` (optional override; Venice defaults to `https://api.venice.ai/api/v1`)
   - `CHATGPT_TOKEN`
   - `CLAUDE_SESSION_KEY`
 - Channel tokens (as needed):

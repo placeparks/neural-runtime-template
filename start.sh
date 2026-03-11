@@ -19,6 +19,7 @@ fi
 
 AGENT_NAME="${NEURALCLAW_AGENT_NAME:-NeuralClaw}"
 PROVIDER="${NEURALCLAW_PROVIDER:-openai}"
+ORIGINAL_PROVIDER="$PROVIDER"
 ALLOWED_TOOLS_RAW="${NEURALCLAW_ALLOWED_TOOLS:-}"
 MESH_ENABLED_RAW="${NEURALCLAW_MESH_ENABLED:-false}"
 MESH_PEERS_JSON="${NEURALCLAW_MESH_PEERS_JSON:-}"
@@ -27,6 +28,7 @@ ENABLE_EVOLUTION_RAW="${NEURALCLAW_ENABLE_EVOLUTION:-false}"
 ENABLE_REFLECTIVE_RAW="${NEURALCLAW_REFLECTIVE_REASONING:-true}"
 LOCAL_URL="${NEURALCLAW_LOCAL_URL:-}"
 PROXY_BASE_URL="${NEURALCLAW_PROXY_BASE_URL:-}"
+OPENAI_BASE_URL="${NEURALCLAW_OPENAI_BASE_URL:-https://api.openai.com/v1}"
 VOICE_ENABLED_RAW="${NEURALCLAW_VOICE_ENABLED:-false}"
 VOICE_PROVIDER="${NEURALCLAW_VOICE_PROVIDER:-twilio}"
 VOICE_REQUIRE_CONFIRM_RAW="${NEURALCLAW_VOICE_REQUIRE_CONFIRM:-true}"
@@ -37,11 +39,16 @@ PERSONA="${NEURALCLAW_PERSONA:-You are NeuralClaw, a helpful and intelligent AI 
 PERSONA="${PERSONA//\"/\'}"
 
 case "$PROVIDER" in
+  venice)
+    PROVIDER="openai"
+    OPENAI_BASE_URL="${NEURALCLAW_OPENAI_BASE_URL:-https://api.venice.ai/api/v1}"
+    ;;
   chatgpt_session) PROVIDER="chatgpt_token" ;;
   claude_session) PROVIDER="claude_token" ;;
 esac
 
-case "$PROVIDER" in
+case "$ORIGINAL_PROVIDER" in
+  venice) DEFAULT_MODEL="venice-uncensored" ;;
   openai) DEFAULT_MODEL="gpt-4o" ;;
   anthropic) DEFAULT_MODEL="claude-sonnet-4-20250514" ;;
   openrouter) DEFAULT_MODEL="anthropic/claude-sonnet-4-20250514" ;;
@@ -115,7 +122,7 @@ ${FALLBACK_TOML}
 
 [providers.openai]
 model = "${MODEL}"
-base_url = "https://api.openai.com/v1"
+base_url = "${OPENAI_BASE_URL}"
 
 [providers.anthropic]
 model = "${MODEL}"
