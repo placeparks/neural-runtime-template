@@ -35,6 +35,8 @@ VOICE_REQUIRE_CONFIRM_RAW="${NEURALCLAW_VOICE_REQUIRE_CONFIRM:-true}"
 TWILIO_ACCOUNT_SID="${TWILIO_ACCOUNT_SID:-}"
 TWILIO_AUTH_TOKEN="${TWILIO_AUTH_TOKEN:-}"
 TWILIO_PHONE_NUMBER="${TWILIO_PHONE_NUMBER:-}"
+DISCORD_TRUST_MODE="${NEURALCLAW_DISCORD_TRUST_MODE:-open}"
+SLACK_TRUST_MODE="${NEURALCLAW_SLACK_TRUST_MODE:-open}"
 PERSONA="${NEURALCLAW_PERSONA:-You are NeuralClaw, a helpful and intelligent AI assistant.}"
 PERSONA="${PERSONA//\"/\'}"
 
@@ -225,6 +227,11 @@ enabled = true
 
 [channels.discord]
 enabled = true
+trust_mode = "${DISCORD_TRUST_MODE}"
+
+[channels.slack]
+enabled = true
+trust_mode = "${SLACK_TRUST_MODE}"
 EOF
 
 python - <<'PY'
