@@ -44,6 +44,11 @@ def _strip_emoji(text: str) -> str:
     return _EMOJI_RE.sub("", text).strip()
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 _SEARCH_QUERY_RE = re.compile(
     r"\b(search|find|look up|google|browse|review|reviews|latest|news|reddit|trustpilot)\b",
     re.IGNORECASE,
@@ -708,6 +713,16 @@ class MeshAwareGateway(NeuralClawGateway):
         if "web" in source:
             return "web"
         return None
+
+    def _build_reply_kwargs(self, msg: Any) -> dict[str, Any]:
+        kwargs = super()._build_reply_kwargs(msg)
+        meta = getattr(msg, "metadata", {}) or {}
+        if meta.get("platform") == "slack" and meta.get("slack_voice_reply"):
+            kwargs["slack_voice_reply"] = True
+            filename = str(meta.get("slack_audio_filename") or "").strip()
+            if filename:
+                kwargs["slack_audio_title"] = f"Voice reply to {filename}"
+        return kwargs
 
     def _is_knowledge_query(self, content: str) -> bool:
         return bool(KNOWLEDGE_QUERY_PATTERN.search(content))
@@ -1742,6 +1757,20 @@ class LocalSlackAdapter(_ChannelAdapterBase):
         self._app: Any = None
         self._handler: Any = None
         self._task: asyncio.Task[None] | None = None
+        self._voice_enabled = _env_flag("NEURALCLAW_SLACK_VOICE_ENABLED", False)
+        self._voice_reply_text = _env_flag("NEURALCLAW_SLACK_VOICE_REPLY_WITH_TEXT", True)
+        self._voice_openai_key = (
+            os.getenv("NEURALCLAW_VOICE_OPENAI_KEY", "").strip()
+            or os.getenv("OPENAI_API_KEY", "").strip()
+        )
+        self._transcribe_model = os.getenv("NEURALCLAW_SLACK_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
+        self._tts_model = os.getenv("NEURALCLAW_SLACK_TTS_MODEL", "gpt-4o-mini-tts").strip() or "gpt-4o-mini-tts"
+        self._tts_voice = os.getenv("NEURALCLAW_SLACK_TTS_VOICE", "alloy").strip() or "alloy"
+        self._tts_instructions = os.getenv(
+            "NEURALCLAW_SLACK_TTS_INSTRUCTIONS",
+            "Speak naturally, warmly, and conversationally. Use expressive but professional delivery.",
+        ).strip()
+        self._max_audio_bytes = int(os.getenv("NEURALCLAW_SLACK_MAX_AUDIO_BYTES", str(15 * 1024 * 1024)))
 
     async def start(self) -> None:
         try:
@@ -1756,7 +1785,11 @@ class LocalSlackAdapter(_ChannelAdapterBase):
 
         @self._app.event("message")
         async def handle_message(event: dict, say: Any) -> None:
-            if event.get("bot_id") or event.get("subtype"):
+            if event.get("bot_id"):
+                return
+            if self._voice_enabled and await adapter._maybe_handle_audio_message(event):
+                return
+            if event.get("subtype"):
                 return
             logger.info(
                 "[Slack] inbound message event channel=%s user=%s subtype=%s",
@@ -1830,11 +1863,173 @@ class LocalSlackAdapter(_ChannelAdapterBase):
     async def send(self, channel_id: str, content: str, **kwargs: Any) -> None:
         if self._app:
             thread_ts = kwargs.get("thread_ts")
+            if kwargs.get("slack_voice_reply") and self._voice_enabled:
+                try:
+                    audio_bytes, filename = await self._synthesize_tts_audio(content)
+                    upload_kwargs: dict[str, Any] = {
+                        "channel": channel_id,
+                        "thread_ts": thread_ts,
+                        "filename": filename,
+                        "file": audio_bytes,
+                        "title": kwargs.get("slack_audio_title", "NeuralClaw voice reply"),
+                    }
+                    if self._voice_reply_text:
+                        upload_kwargs["initial_comment"] = content
+                    await self._app.client.files_upload_v2(**upload_kwargs)
+                    return
+                except Exception:
+                    logger.exception("[Slack] voice reply synthesis/upload failed - falling back to text")
+
             await self._app.client.chat_postMessage(
                 channel=channel_id,
                 text=content,
                 thread_ts=thread_ts,
             )
+
+    async def _maybe_handle_audio_message(self, event: dict[str, Any]) -> bool:
+        from neuralclaw.channels.protocol import ChannelMessage
+
+        audio_file = self._extract_audio_file(event)
+        if not audio_file:
+            return False
+        if not self._voice_openai_key:
+            logger.warning("[Slack] voice event ignored - no OpenAI key configured")
+            return False
+
+        channel_id = str(event.get("channel") or "").strip()
+        thread_ts = event.get("thread_ts", event.get("ts"))
+        user_id = str(event.get("user") or "unknown").strip() or "unknown"
+        user_name = str(event.get("username") or event.get("user_profile", {}).get("display_name") or "Unknown").strip() or "Unknown"
+
+        try:
+            file_bytes = await self._download_slack_file(audio_file)
+            transcript = await self._transcribe_audio(audio_file, file_bytes)
+            if not transcript:
+                raise RuntimeError("Transcription returned empty text.")
+        except Exception as exc:
+            logger.warning("[Slack] voice message processing failed: %s", exc)
+            if self._app and channel_id:
+                try:
+                    await self._app.client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"I couldn't process that audio message: {exc}",
+                        thread_ts=thread_ts,
+                    )
+                except Exception:
+                    logger.exception("[Slack] failed to post audio-processing error")
+            return True
+
+        logger.info("[Slack] inbound audio message channel=%s user=%s transcript_len=%d", channel_id, user_id, len(transcript))
+        msg = ChannelMessage(
+            content=transcript,
+            author_id=user_id,
+            author_name=user_name,
+            channel_id=channel_id,
+            raw=event,
+            metadata={
+                "platform": "slack",
+                "source": "slack",
+                "channel": "slack",
+                "thread_ts": thread_ts,
+                "slack_voice_reply": True,
+                "slack_audio_file_id": audio_file.get("id"),
+                "slack_audio_filename": audio_file.get("name"),
+            },
+        )
+        try:
+            await self._dispatch(msg)
+        except Exception:
+            logger.exception("[Slack] dispatch failure for audio message event")
+        return True
+
+    def _extract_audio_file(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        files = event.get("files")
+        if not isinstance(files, list):
+            return None
+        for file_obj in files:
+            if not isinstance(file_obj, dict):
+                continue
+            mimetype = str(file_obj.get("mimetype") or "").lower()
+            filetype = str(file_obj.get("filetype") or "").lower()
+            if mimetype.startswith("audio/") or filetype in {"mp3", "m4a", "wav", "ogg", "opus", "mpeg", "mp4"}:
+                return file_obj
+        return None
+
+    async def _download_slack_file(self, file_obj: dict[str, Any]) -> bytes:
+        url = str(file_obj.get("url_private_download") or file_obj.get("url_private") or "").strip()
+        if not url:
+            raise RuntimeError("Slack audio file has no downloadable URL.")
+
+        headers = {"Authorization": f"Bearer {self._bot_token}"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=45)) as resp:
+                body = await resp.read()
+                if resp.status != 200:
+                    raise RuntimeError(f"Slack file download failed ({resp.status}): {body[:200]!r}")
+        if not body:
+            raise RuntimeError("Slack audio download returned empty content.")
+        if len(body) > self._max_audio_bytes:
+            raise RuntimeError(
+                f"Slack audio file exceeds limit ({len(body)} bytes > {self._max_audio_bytes} bytes)."
+            )
+        return body
+
+    async def _transcribe_audio(self, file_obj: dict[str, Any], file_bytes: bytes) -> str:
+        filename = str(file_obj.get("name") or "slack-audio").strip() or "slack-audio"
+        mimetype = str(file_obj.get("mimetype") or "application/octet-stream").strip() or "application/octet-stream"
+        form = aiohttp.FormData()
+        form.add_field("model", self._transcribe_model)
+        form.add_field("file", file_bytes, filename=filename, content_type=mimetype)
+        headers = {"Authorization": f"Bearer {self._voice_openai_key}"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                raw_text = await resp.text()
+                if resp.status != 200:
+                    raise RuntimeError(f"OpenAI transcription failed ({resp.status}): {raw_text[:300]}")
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Transcription returned invalid JSON: {exc}") from exc
+        transcript = str(data.get("text") or "").strip()
+        if not transcript:
+            raise RuntimeError("OpenAI transcription returned empty text.")
+        return transcript
+
+    async def _synthesize_tts_audio(self, text: str) -> tuple[bytes, str]:
+        clean_text = _strip_emoji(text).strip()
+        if not clean_text:
+            raise RuntimeError("Cannot synthesize empty reply.")
+        if len(clean_text) > 4000:
+            clean_text = clean_text[:4000].rsplit(" ", 1)[0].strip() or clean_text[:4000]
+
+        headers = {
+            "Authorization": f"Bearer {self._voice_openai_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self._tts_model,
+            "voice": self._tts_voice,
+            "input": clean_text,
+            "response_format": "mp3",
+            "instructions": self._tts_instructions,
+        }
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(
+                "https://api.openai.com/v1/audio/speech",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                audio_bytes = await resp.read()
+                if resp.status != 200:
+                    preview = audio_bytes[:300].decode("utf-8", errors="replace")
+                    raise RuntimeError(f"OpenAI TTS failed ({resp.status}): {preview}")
+        if not audio_bytes:
+            raise RuntimeError("OpenAI TTS returned empty audio.")
+        return audio_bytes, f"neuralclaw-reply-{int(time.time())}.mp3"
 
 
 
