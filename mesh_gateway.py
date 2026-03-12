@@ -1966,6 +1966,7 @@ class LocalSlackAdapter(_ChannelAdapterBase):
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=45)) as resp:
                 body = await resp.read()
+                content_type = str(resp.headers.get("Content-Type") or "").strip().lower()
                 if resp.status != 200:
                     raise RuntimeError(f"Slack file download failed ({resp.status}): {body[:200]!r}")
         if not body:
@@ -1974,6 +1975,21 @@ class LocalSlackAdapter(_ChannelAdapterBase):
             raise RuntimeError(
                 f"Slack audio file exceeds limit ({len(body)} bytes > {self._max_audio_bytes} bytes)."
             )
+        if content_type.startswith("text/") or content_type.startswith("application/json"):
+            preview = body[:200].decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Slack file download returned non-audio content-type '{content_type or 'unknown'}': {preview}"
+            )
+        if body.startswith(b"<!DOCTYPE html") or body.startswith(b"<html") or body.startswith(b"{"):
+            preview = body[:200].decode("utf-8", errors="replace")
+            raise RuntimeError(f"Slack file download returned unexpected payload: {preview}")
+        logger.info(
+            "[Slack] downloaded audio file id=%s name=%s mimetype=%s bytes=%d",
+            file_obj.get("id"),
+            file_obj.get("name"),
+            content_type or file_obj.get("mimetype"),
+            len(body),
+        )
         return body
 
     async def _transcribe_audio(self, file_obj: dict[str, Any], file_bytes: bytes) -> str:
@@ -2037,7 +2053,8 @@ class LocalSlackAdapter(_ChannelAdapterBase):
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0 or not output_path.exists():
-                preview = stderr.decode("utf-8", errors="replace")[:300]
+                stderr_text = stderr.decode("utf-8", errors="replace")
+                preview = stderr_text[-600:] if len(stderr_text) > 600 else stderr_text
                 raise RuntimeError(f"Audio conversion failed: {preview}")
 
             return output_path.read_bytes(), "slack-audio.wav", "audio/wav"
