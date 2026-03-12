@@ -51,30 +51,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-_OPENAI_TRANSCRIBE_MIME_TO_EXT = {
-    "audio/mpeg": ".mp3",
-    "audio/mp3": ".mp3",
-    "audio/mp4": ".m4a",
-    "audio/x-m4a": ".m4a",
-    "audio/m4a": ".m4a",
-    "audio/wav": ".wav",
-    "audio/x-wav": ".wav",
-    "audio/webm": ".webm",
-    "video/webm": ".webm",
-}
-
-_OPENAI_TRANSCRIBE_FILETYPE_TO_EXT = {
-    "mp3": ".mp3",
-    "mpeg": ".mp3",
-    "mpga": ".mp3",
-    "mp4": ".m4a",
-    "m4a": ".m4a",
-    "wav": ".wav",
-    "wave": ".wav",
-    "webm": ".webm",
-}
-
-
 _SEARCH_QUERY_RE = re.compile(
     r"\b(search|find|look up|google|browse|review|reviews|latest|news|reddit|trustpilot)\b",
     re.IGNORECASE,
@@ -2031,39 +2007,13 @@ class LocalSlackAdapter(_ChannelAdapterBase):
     ) -> tuple[bytes, str, str]:
         filename = str(file_obj.get("name") or "slack-audio").strip() or "slack-audio"
         mimetype = str(file_obj.get("mimetype") or "application/octet-stream").strip().lower() or "application/octet-stream"
-        filetype = str(file_obj.get("filetype") or "").strip().lower()
-
-        suffix = self._guess_transcription_suffix(filename, mimetype, filetype)
-        if suffix:
-            if not filename.lower().endswith(suffix):
-                filename = f"{filename}{suffix}" if "." not in Path(filename).name else str(Path(filename).with_suffix(suffix))
-            normalized_mimetype = self._mimetype_for_suffix(suffix)
-            return file_bytes, filename, normalized_mimetype
-
         if not shutil.which("ffmpeg"):
             raise RuntimeError(
-                f"Unsupported Slack audio format '{mimetype or filetype or 'unknown'}' and ffmpeg is not available for conversion."
+                f"ffmpeg is required to normalize Slack audio format '{mimetype or 'unknown'}' before transcription."
             )
 
+        logger.info("[Slack] normalizing audio before transcription filename=%s mimetype=%s size=%d", filename, mimetype, len(file_bytes))
         return await self._transcode_audio_to_wav(file_bytes, filename)
-
-    def _guess_transcription_suffix(self, filename: str, mimetype: str, filetype: str) -> str | None:
-        existing_suffix = Path(filename).suffix.lower()
-        if existing_suffix in {".mp3", ".m4a", ".wav", ".webm"}:
-            return existing_suffix
-        if mimetype in _OPENAI_TRANSCRIBE_MIME_TO_EXT:
-            return _OPENAI_TRANSCRIBE_MIME_TO_EXT[mimetype]
-        if filetype in _OPENAI_TRANSCRIBE_FILETYPE_TO_EXT:
-            return _OPENAI_TRANSCRIBE_FILETYPE_TO_EXT[filetype]
-        return None
-
-    def _mimetype_for_suffix(self, suffix: str) -> str:
-        return {
-            ".mp3": "audio/mpeg",
-            ".m4a": "audio/mp4",
-            ".wav": "audio/wav",
-            ".webm": "audio/webm",
-        }.get(suffix, "application/octet-stream")
 
     async def _transcode_audio_to_wav(self, file_bytes: bytes, filename: str) -> tuple[bytes, str, str]:
         source_suffix = Path(filename).suffix or ".input"
