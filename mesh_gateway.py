@@ -8,7 +8,9 @@ import logging
 import os
 import re
 import signal
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -47,6 +49,30 @@ def _strip_emoji(text: str) -> str:
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name, "true" if default else "false").strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+_OPENAI_TRANSCRIBE_MIME_TO_EXT = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/m4a": ".m4a",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/webm": ".webm",
+    "video/webm": ".webm",
+}
+
+_OPENAI_TRANSCRIBE_FILETYPE_TO_EXT = {
+    "mp3": ".mp3",
+    "mpeg": ".mp3",
+    "mpga": ".mp3",
+    "mp4": ".m4a",
+    "m4a": ".m4a",
+    "wav": ".wav",
+    "wave": ".wav",
+    "webm": ".webm",
+}
 
 
 _SEARCH_QUERY_RE = re.compile(
@@ -1975,11 +2001,10 @@ class LocalSlackAdapter(_ChannelAdapterBase):
         return body
 
     async def _transcribe_audio(self, file_obj: dict[str, Any], file_bytes: bytes) -> str:
-        filename = str(file_obj.get("name") or "slack-audio").strip() or "slack-audio"
-        mimetype = str(file_obj.get("mimetype") or "application/octet-stream").strip() or "application/octet-stream"
+        prepared_bytes, filename, mimetype = await self._prepare_audio_for_transcription(file_obj, file_bytes)
         form = aiohttp.FormData()
         form.add_field("model", self._transcribe_model)
-        form.add_field("file", file_bytes, filename=filename, content_type=mimetype)
+        form.add_field("file", prepared_bytes, filename=filename, content_type=mimetype)
         headers = {"Authorization": f"Bearer {self._voice_openai_key}"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.post(
@@ -1998,6 +2023,74 @@ class LocalSlackAdapter(_ChannelAdapterBase):
         if not transcript:
             raise RuntimeError("OpenAI transcription returned empty text.")
         return transcript
+
+    async def _prepare_audio_for_transcription(
+        self,
+        file_obj: dict[str, Any],
+        file_bytes: bytes,
+    ) -> tuple[bytes, str, str]:
+        filename = str(file_obj.get("name") or "slack-audio").strip() or "slack-audio"
+        mimetype = str(file_obj.get("mimetype") or "application/octet-stream").strip().lower() or "application/octet-stream"
+        filetype = str(file_obj.get("filetype") or "").strip().lower()
+
+        suffix = self._guess_transcription_suffix(filename, mimetype, filetype)
+        if suffix:
+            if not filename.lower().endswith(suffix):
+                filename = f"{filename}{suffix}" if "." not in Path(filename).name else str(Path(filename).with_suffix(suffix))
+            normalized_mimetype = self._mimetype_for_suffix(suffix)
+            return file_bytes, filename, normalized_mimetype
+
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError(
+                f"Unsupported Slack audio format '{mimetype or filetype or 'unknown'}' and ffmpeg is not available for conversion."
+            )
+
+        return await self._transcode_audio_to_wav(file_bytes, filename)
+
+    def _guess_transcription_suffix(self, filename: str, mimetype: str, filetype: str) -> str | None:
+        existing_suffix = Path(filename).suffix.lower()
+        if existing_suffix in {".mp3", ".m4a", ".wav", ".webm"}:
+            return existing_suffix
+        if mimetype in _OPENAI_TRANSCRIBE_MIME_TO_EXT:
+            return _OPENAI_TRANSCRIBE_MIME_TO_EXT[mimetype]
+        if filetype in _OPENAI_TRANSCRIBE_FILETYPE_TO_EXT:
+            return _OPENAI_TRANSCRIBE_FILETYPE_TO_EXT[filetype]
+        return None
+
+    def _mimetype_for_suffix(self, suffix: str) -> str:
+        return {
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".wav": "audio/wav",
+            ".webm": "audio/webm",
+        }.get(suffix, "application/octet-stream")
+
+    async def _transcode_audio_to_wav(self, file_bytes: bytes, filename: str) -> tuple[bytes, str, str]:
+        source_suffix = Path(filename).suffix or ".input"
+        with tempfile.TemporaryDirectory(prefix="slack-audio-") as tmpdir:
+            source_path = Path(tmpdir) / f"source{source_suffix}"
+            output_path = Path(tmpdir) / "normalized.wav"
+            source_path.write_bytes(file_bytes)
+
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(source_path),
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                str(output_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0 or not output_path.exists():
+                preview = stderr.decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(f"Audio conversion failed: {preview}")
+
+            return output_path.read_bytes(), "slack-audio.wav", "audio/wav"
 
     async def _synthesize_tts_audio(self, text: str) -> tuple[bytes, str]:
         clean_text = _strip_emoji(text).strip()
