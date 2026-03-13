@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Python runtime dependencies at build time.
 # Pinned to 0.7.7 for the current SaaS/runtime integration.
-RUN pip install --no-cache-dir "neuralclaw==0.7.7" aiohttp
+RUN pip install --no-cache-dir "neuralclaw==0.7.7" aiohttp PyNaCl discord-ext-voice-recv
 
 # Copy pre-built node_modules from builder — no npm install needed here
 COPY --from=wa-builder /app/wa_bridge/node_modules /app/wa_bridge/node_modules

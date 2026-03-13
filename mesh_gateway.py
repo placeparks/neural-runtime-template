@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
+import io
 import json
 import logging
 import os
@@ -12,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import time
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -724,6 +727,11 @@ class MeshAwareGateway(NeuralClawGateway):
             filename = str(meta.get("slack_audio_filename") or "").strip()
             if filename:
                 kwargs["slack_audio_title"] = f"Voice reply to {filename}"
+        if meta.get("platform") == "discord" and meta.get("discord_voice_reply"):
+            kwargs["discord_voice_reply"] = True
+            guild_name = str(meta.get("discord_guild_name") or "").strip()
+            if guild_name:
+                kwargs["discord_voice_title"] = f"Voice reply in {guild_name}"
         return kwargs
 
     def _is_knowledge_query(self, content: str) -> bool:
@@ -1744,6 +1752,487 @@ async def _handle_whatsapp_status(request: web.Request) -> web.Response:
     return web.json_response(state)
 
 
+class LocalDiscordAdapter(_ChannelAdapterBase):
+    name = "discord"
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._token = token
+        self._client: Any = None
+        self._task: asyncio.Task[None] | None = None
+        self._voice_enabled = _env_flag("NEURALCLAW_DISCORD_VOICE_ENABLED", False)
+        self._voice_reply_text = _env_flag("NEURALCLAW_DISCORD_VOICE_REPLY_WITH_TEXT", True)
+        self._voice_openai_key = (
+            os.getenv("NEURALCLAW_VOICE_OPENAI_KEY", "").strip()
+            or os.getenv("OPENAI_API_KEY", "").strip()
+        )
+        self._transcribe_model = (
+            os.getenv("NEURALCLAW_DISCORD_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe").strip()
+            or "gpt-4o-mini-transcribe"
+        )
+        self._tts_model = os.getenv("NEURALCLAW_DISCORD_TTS_MODEL", "gpt-4o-mini-tts").strip() or "gpt-4o-mini-tts"
+        self._tts_voice = os.getenv("NEURALCLAW_DISCORD_TTS_VOICE", "alloy").strip() or "alloy"
+        self._tts_instructions = (
+            os.getenv(
+                "NEURALCLAW_DISCORD_TTS_INSTRUCTIONS",
+                "Speak naturally, warmly, and conversationally. Sound human and responsive.",
+            ).strip()
+            or "Speak naturally and conversationally."
+        )
+        self._segment_silence_ms = max(300, int(os.getenv("NEURALCLAW_DISCORD_VOICE_SILENCE_MS", "900")))
+        self._min_segment_ms = max(150, int(os.getenv("NEURALCLAW_DISCORD_VOICE_MIN_MS", "450")))
+        self._max_segment_seconds = max(3, int(os.getenv("NEURALCLAW_DISCORD_VOICE_MAX_SECONDS", "15")))
+        self._voice_buffers: dict[tuple[int, int], bytearray] = {}
+        self._voice_users: dict[tuple[int, int], Any] = {}
+        self._voice_flush_handles: dict[tuple[int, int], asyncio.Handle] = {}
+        self._voice_sessions: dict[int, dict[str, Any]] = {}
+        self._playback_tasks: dict[int, asyncio.Task[None]] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    async def start(self) -> None:
+        try:
+            import discord
+        except ImportError as exc:
+            raise RuntimeError("discord.py is not installed in the runtime image.") from exc
+
+        self._loop = asyncio.get_running_loop()
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.voice_states = True
+        intents.guilds = True
+        intents.members = True
+        self._client = discord.Client(intents=intents)
+
+        adapter = self
+
+        @self._client.event
+        async def on_ready() -> None:
+            logger.info("[Discord] Logged in as %s", self._client.user)
+
+        @self._client.event
+        async def on_voice_state_update(member: Any, before: Any, after: Any) -> None:
+            if not self._client or not self._client.user or member.id != self._client.user.id:
+                return
+            if before.channel and not after.channel:
+                await adapter._teardown_voice_session(before.channel.guild.id)
+
+        @self._client.event
+        async def on_message(message: Any) -> None:
+            if message.author == self._client.user:
+                return
+
+            is_dm = isinstance(message.channel, discord.DMChannel)
+            is_mentioned = self._client.user in message.mentions if self._client.user else False
+            if not is_dm and not is_mentioned:
+                return
+
+            content = message.content or ""
+            if is_mentioned and self._client.user:
+                content = (
+                    content.replace(f"<@{self._client.user.id}>", "")
+                    .replace(f"<@!{self._client.user.id}>", "")
+                    .strip()
+                )
+
+            if adapter._voice_enabled and message.guild:
+                lowered = content.strip().lower()
+                if adapter._is_join_voice_command(lowered):
+                    await adapter._handle_join_voice_command(message)
+                    return
+                if adapter._is_leave_voice_command(lowered):
+                    await adapter._handle_leave_voice_command(message)
+                    return
+
+            from neuralclaw.channels.protocol import ChannelMessage
+
+            msg = ChannelMessage(
+                content=content,
+                author_id=str(message.author.id),
+                author_name=message.author.display_name,
+                channel_id=str(message.channel.id),
+                raw=message,
+                metadata={
+                    "platform": "discord",
+                    "source": "discord",
+                    "is_dm": is_dm,
+                    "guild": message.guild.name if message.guild else None,
+                },
+            )
+            await adapter._dispatch(msg)
+
+        self._task = asyncio.create_task(self._client.start(self._token))
+
+    async def stop(self) -> None:
+        for guild_id in list(self._voice_sessions):
+            await self._teardown_voice_session(guild_id)
+        for handle in self._voice_flush_handles.values():
+            handle.cancel()
+        self._voice_flush_handles.clear()
+        if self._client:
+            await self._client.close()
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def send(self, channel_id: str, content: str, **kwargs: Any) -> None:
+        if not self._client:
+            return
+        if channel_id.startswith("discord-voice:") and kwargs.get("discord_voice_reply") and self._voice_enabled:
+            guild_id = int(channel_id.split(":", 1)[1])
+            await self._send_voice_reply(guild_id, content, **kwargs)
+            return
+
+        channel = self._client.get_channel(int(channel_id))
+        if channel is None:
+            channel = await self._client.fetch_channel(int(channel_id))
+        if channel:
+            await channel.send(content)
+
+    def _is_join_voice_command(self, content: str) -> bool:
+        return content in {
+            "join voice",
+            "join voice channel",
+            "join my voice channel",
+            "join vc",
+            "come to voice",
+            "come to my voice channel",
+            "join me in voice",
+        }
+
+    def _is_leave_voice_command(self, content: str) -> bool:
+        return content in {
+            "leave voice",
+            "leave voice channel",
+            "leave vc",
+            "disconnect",
+            "disconnect voice",
+        }
+
+    async def _handle_join_voice_command(self, message: Any) -> None:
+        if not self._voice_openai_key:
+            await message.channel.send("Discord voice is enabled, but no OpenAI key is configured for speech.")
+            return
+
+        voice_state = getattr(message.author, "voice", None)
+        voice_channel = getattr(voice_state, "channel", None)
+        if not voice_channel:
+            await message.channel.send("Join a voice channel first, then ask me to join.")
+            return
+
+        try:
+            await self._join_voice_channel(voice_channel, message.channel)
+        except Exception as exc:
+            logger.exception("[Discord] failed to join voice channel")
+            await message.channel.send(f"I couldn't join that voice channel: {exc}")
+            return
+
+        await message.channel.send(f"Joined voice channel `{voice_channel.name}`. Speak normally and I'll answer in voice.")
+
+    async def _handle_leave_voice_command(self, message: Any) -> None:
+        guild = message.guild
+        if not guild:
+            await message.channel.send("That command only works in a server text channel.")
+            return
+        if guild.id not in self._voice_sessions:
+            await message.channel.send("I'm not in a voice channel right now.")
+            return
+        await self._teardown_voice_session(guild.id)
+        await message.channel.send("Left the voice channel.")
+
+    async def _join_voice_channel(self, voice_channel: Any, control_channel: Any) -> None:
+        try:
+            from discord.ext import voice_recv
+        except ImportError as exc:
+            raise RuntimeError("discord-ext-voice-recv is not installed in the runtime image.") from exc
+
+        guild_id = voice_channel.guild.id
+        existing = self._voice_sessions.get(guild_id)
+        if existing:
+            voice_client = existing["voice_client"]
+            if voice_client.channel.id != voice_channel.id:
+                await voice_client.move_to(voice_channel)
+            existing["control_channel_id"] = control_channel.id
+            existing["voice_channel_id"] = voice_channel.id
+            return
+
+        voice_client = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
+        sink = _create_discord_voice_sink(voice_recv, self, guild_id)
+        voice_client.listen(sink)
+        self._voice_sessions[guild_id] = {
+            "voice_client": voice_client,
+            "sink": sink,
+            "control_channel_id": control_channel.id,
+            "voice_channel_id": voice_channel.id,
+            "guild_name": voice_channel.guild.name,
+            "queue": asyncio.Queue(),
+        }
+        logger.info("[Discord] voice session started guild=%s channel=%s", guild_id, voice_channel.id)
+
+    async def _teardown_voice_session(self, guild_id: int) -> None:
+        session = self._voice_sessions.pop(guild_id, None)
+        if not session:
+            return
+        task = self._playback_tasks.pop(guild_id, None)
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        voice_client = session.get("voice_client")
+        try:
+            if voice_client:
+                if hasattr(voice_client, "stop_listening"):
+                    voice_client.stop_listening()
+                if voice_client.is_connected():
+                    await voice_client.disconnect(force=True)
+        except Exception:
+            logger.exception("[Discord] error tearing down voice session guild=%s", guild_id)
+        for key in [k for k in self._voice_buffers if k[0] == guild_id]:
+            self._voice_buffers.pop(key, None)
+            self._voice_users.pop(key, None)
+            handle = self._voice_flush_handles.pop(key, None)
+            if handle:
+                handle.cancel()
+        logger.info("[Discord] voice session stopped guild=%s", guild_id)
+
+    def _schedule_voice_frame(self, guild_id: int, user: Any, pcm: bytes) -> None:
+        if not self._loop:
+            return
+        self._loop.call_soon_threadsafe(self._handle_voice_frame, guild_id, user, pcm)
+
+    def _handle_voice_frame(self, guild_id: int, user: Any, pcm: bytes) -> None:
+        if getattr(user, "bot", False):
+            return
+        key = (guild_id, int(user.id))
+        buf = self._voice_buffers.setdefault(key, bytearray())
+        buf.extend(pcm)
+        self._voice_users[key] = user
+
+        handle = self._voice_flush_handles.pop(key, None)
+        if handle:
+            handle.cancel()
+
+        max_bytes = self._pcm_bytes_for_seconds(self._max_segment_seconds)
+        if len(buf) >= max_bytes:
+            asyncio.create_task(self._flush_voice_segment(guild_id, int(user.id)))
+            return
+
+        delay = self._segment_silence_ms / 1000
+        self._voice_flush_handles[key] = asyncio.get_running_loop().call_later(
+            delay,
+            lambda: asyncio.create_task(self._flush_voice_segment(guild_id, int(user.id))),
+        )
+
+    async def _flush_voice_segment(self, guild_id: int, user_id: int) -> None:
+        key = (guild_id, user_id)
+        handle = self._voice_flush_handles.pop(key, None)
+        if handle:
+            handle.cancel()
+
+        pcm_bytes = bytes(self._voice_buffers.pop(key, b""))
+        user = self._voice_users.pop(key, None)
+        if not pcm_bytes or not user:
+            return
+        if len(pcm_bytes) < self._pcm_bytes_for_ms(self._min_segment_ms):
+            return
+
+        try:
+            wav_bytes = self._build_wav_from_pcm(pcm_bytes)
+            transcript = await self._transcribe_wav_bytes(wav_bytes)
+            if not transcript:
+                return
+        except Exception as exc:
+            logger.warning("[Discord] voice segment processing failed guild=%s user=%s: %s", guild_id, user_id, exc)
+            await self._send_text_to_control_channel(guild_id, f"I couldn't process that voice segment: {exc}")
+            return
+
+        logger.info("[Discord] inbound voice segment guild=%s user=%s transcript_len=%d", guild_id, user_id, len(transcript))
+
+        from neuralclaw.channels.protocol import ChannelMessage
+
+        session = self._voice_sessions.get(guild_id) or {}
+        msg = ChannelMessage(
+            content=transcript,
+            author_id=str(user_id),
+            author_name=getattr(user, "display_name", getattr(user, "name", f"user-{user_id}")),
+            channel_id=f"discord-voice:{guild_id}",
+            raw=user,
+            metadata={
+                "platform": "discord",
+                "source": "discord",
+                "discord_voice_reply": True,
+                "discord_guild_id": guild_id,
+                "discord_guild_name": session.get("guild_name"),
+                "discord_voice_channel_id": session.get("voice_channel_id"),
+                "discord_control_channel_id": session.get("control_channel_id"),
+            },
+        )
+        await self._dispatch(msg)
+
+    def _build_wav_from_pcm(self, pcm_bytes: bytes) -> bytes:
+        output = io.BytesIO()
+        with wave.open(output, "wb") as wav_file:
+            wav_file.setnchannels(2)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(48000)
+            wav_file.writeframes(pcm_bytes)
+        return output.getvalue()
+
+    async def _transcribe_wav_bytes(self, wav_bytes: bytes) -> str:
+        form = aiohttp.FormData()
+        form.add_field("model", self._transcribe_model)
+        form.add_field("file", wav_bytes, filename="discord-voice.wav", content_type="audio/wav")
+        headers = {"Authorization": f"Bearer {self._voice_openai_key}"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                raw_text = await resp.text()
+                if resp.status != 200:
+                    raise RuntimeError(f"OpenAI transcription failed ({resp.status}): {raw_text[:300]}")
+        data = json.loads(raw_text)
+        transcript = str(data.get("text") or "").strip()
+        if not transcript:
+            raise RuntimeError("OpenAI transcription returned empty text.")
+        return transcript
+
+    async def _send_voice_reply(self, guild_id: int, content: str, **kwargs: Any) -> None:
+        session = self._voice_sessions.get(guild_id)
+        if not session:
+            await self._send_text_to_control_channel(guild_id, content)
+            return
+        audio_bytes, extension = await self._synthesize_tts_audio(content)
+        await session["queue"].put((audio_bytes, extension, content))
+        task = self._playback_tasks.get(guild_id)
+        if not task or task.done():
+            self._playback_tasks[guild_id] = asyncio.create_task(self._consume_voice_queue(guild_id))
+
+    async def _consume_voice_queue(self, guild_id: int) -> None:
+        session = self._voice_sessions.get(guild_id)
+        if not session:
+            return
+        queue: asyncio.Queue = session["queue"]
+        voice_client = session["voice_client"]
+        while True:
+            try:
+                audio_bytes, extension, text = await queue.get()
+            except asyncio.CancelledError:
+                break
+
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp:
+                    tmp.write(audio_bytes)
+                    temp_path = tmp.name
+
+                loop = asyncio.get_running_loop()
+                finished = loop.create_future()
+
+                def _after_play(err: Exception | None) -> None:
+                    if err and not finished.done():
+                        loop.call_soon_threadsafe(finished.set_exception, err)
+                    elif not finished.done():
+                        loop.call_soon_threadsafe(finished.set_result, None)
+
+                import discord
+
+                source = discord.FFmpegPCMAudio(temp_path)
+                voice_client.play(source, after=_after_play)
+                await finished
+                if self._voice_reply_text:
+                    await self._send_text_to_control_channel(guild_id, text)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("[Discord] voice playback failed guild=%s: %s", guild_id, exc)
+                await self._send_text_to_control_channel(guild_id, f"Voice reply failed, falling back to text: {text}")
+            finally:
+                if temp_path:
+                    with contextlib.suppress(Exception):
+                        os.unlink(temp_path)
+                queue.task_done()
+
+            if queue.empty():
+                break
+
+        self._playback_tasks.pop(guild_id, None)
+
+    async def _synthesize_tts_audio(self, text: str) -> tuple[bytes, str]:
+        clean_text = _strip_emoji(text).strip()
+        if not clean_text:
+            raise RuntimeError("Cannot synthesize empty reply.")
+        if len(clean_text) > 4000:
+            clean_text = clean_text[:4000].rsplit(" ", 1)[0].strip() or clean_text[:4000]
+
+        headers = {
+            "Authorization": f"Bearer {self._voice_openai_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self._tts_model,
+            "voice": self._tts_voice,
+            "input": clean_text,
+            "instructions": self._tts_instructions,
+            "format": "mp3",
+        }
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(
+                "https://api.openai.com/v1/audio/speech",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                audio_bytes = await resp.read()
+                if resp.status != 200:
+                    detail = audio_bytes.decode("utf-8", errors="replace")[:300]
+                    raise RuntimeError(f"OpenAI speech failed ({resp.status}): {detail}")
+        if not audio_bytes:
+            raise RuntimeError("OpenAI speech returned empty audio.")
+        return audio_bytes, ".mp3"
+
+    async def _send_text_to_control_channel(self, guild_id: int, content: str) -> None:
+        if not self._client or not content:
+            return
+        session = self._voice_sessions.get(guild_id)
+        channel_id = session.get("control_channel_id") if session else None
+        if not channel_id:
+            return
+        channel = self._client.get_channel(int(channel_id))
+        if channel is None:
+            channel = await self._client.fetch_channel(int(channel_id))
+        if channel:
+            await channel.send(content)
+
+    def _pcm_bytes_for_ms(self, duration_ms: int) -> int:
+        return int((48000 * 2 * 2) * (duration_ms / 1000))
+
+    def _pcm_bytes_for_seconds(self, duration_seconds: int) -> int:
+        return int(48000 * 2 * 2 * duration_seconds)
+
+
+def _create_discord_voice_sink(voice_recv_mod: Any, adapter: LocalDiscordAdapter, guild_id: int) -> Any:
+    class _DiscordVoiceReceiveSink(voice_recv_mod.AudioSink):
+        def __init__(self) -> None:
+            super().__init__()
+
+        def wants_opus(self) -> bool:
+            return False
+
+        def write(self, user: Any, data: Any) -> None:
+            pcm = getattr(data, "pcm", None)
+            if not pcm or not user:
+                return
+            adapter._schedule_voice_frame(guild_id, user, pcm)
+
+        def cleanup(self) -> None:
+            return
+
+    return _DiscordVoiceReceiveSink()
+
+
 class LocalSlackAdapter(_ChannelAdapterBase):
     """
     Slack adapter pinned in runtime template so we can enforce metadata.source
@@ -2148,9 +2637,7 @@ async def _run_gateway() -> None:
 
             gw.add_channel(TelegramAdapter(ch_config.token))
         elif ch_config.name == "discord":
-            from neuralclaw.channels.discord_adapter import DiscordAdapter
-
-            gw.add_channel(DiscordAdapter(ch_config.token))
+            gw.add_channel(LocalDiscordAdapter(ch_config.token))
 
     slack_bot = get_api_key("slack_bot")
     slack_app = get_api_key("slack_app")
