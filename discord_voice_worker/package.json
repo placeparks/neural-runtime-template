@@ -1,0 +1,14 @@
+{
+  "name": "neuralclaw-discord-voice-worker",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Discord transport for NeuralClaw text + voice",
+  "main": "index.js",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.18.0",
+    "discord.js": "^14.19.3",
+    "prism-media": "^1.3.5"
+  }
+}

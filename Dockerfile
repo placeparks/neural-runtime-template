@@ -22,13 +22,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Python runtime dependencies at build time.
 # Pinned to 0.7.7 for the current SaaS/runtime integration.
-RUN pip install --no-cache-dir "neuralclaw==0.7.7" aiohttp PyNaCl discord-ext-voice-recv
+RUN pip install --no-cache-dir "neuralclaw==0.7.7" aiohttp
+
+WORKDIR /app/discord_voice_worker
+COPY discord_voice_worker/package.json /app/discord_voice_worker/package.json
+RUN npm install --omit=dev
 
 # Copy pre-built node_modules from builder — no npm install needed here
 COPY --from=wa-builder /app/wa_bridge/node_modules /app/wa_bridge/node_modules
 COPY --from=wa-builder /app/wa_bridge/package.json /app/wa_bridge/package.json
 
 WORKDIR /app
+COPY discord_voice_worker /app/discord_voice_worker
 COPY start.sh /app/start.sh
 COPY mesh_gateway.py /app/mesh_gateway.py
 RUN chmod +x /app/start.sh

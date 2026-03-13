@@ -839,12 +839,18 @@ async def _handle_a2a_message(request: web.Request) -> web.Response:
 
     app = request.app
     gw: MeshAwareGateway = app["gateway"]
+    message_metadata = data.get("message_metadata")
+    if not isinstance(message_metadata, dict):
+        message_metadata = None
+    channel_id = str(data.get("channel_id", "mesh") or "mesh")
+    channel_type_name = str(data.get("channel_type_name", "CLI") or "CLI")
     response = await gw.process_message(
         content=content,
         author_id=str(data.get("from", "peer")),
-        author_name=str(data.get("from", "peer")),
-        channel_id="mesh",
-        channel_type_name="CLI",
+        author_name=str(data.get("author_name", data.get("from", "peer"))),
+        channel_id=channel_id,
+        channel_type_name=channel_type_name,
+        message_metadata=message_metadata,
     )
     return web.json_response({"content": response, "payload": {"source": "mesh"}})
 
@@ -2637,7 +2643,10 @@ async def _run_gateway() -> None:
 
             gw.add_channel(TelegramAdapter(ch_config.token))
         elif ch_config.name == "discord":
-            gw.add_channel(LocalDiscordAdapter(ch_config.token))
+            if _env_flag("NEURALCLAW_DISCORD_VOICE_ENABLED", False):
+                logger.info("[Discord] Python adapter disabled; Node voice worker will own Discord transport")
+            else:
+                gw.add_channel(LocalDiscordAdapter(ch_config.token))
 
     slack_bot = get_api_key("slack_bot")
     slack_app = get_api_key("slack_app")

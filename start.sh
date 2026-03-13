@@ -281,4 +281,26 @@ if [[ -f "$HOME/.neuralclaw/mesh-peers.json" ]]; then
   echo "[runtime] mesh peers file written: $HOME/.neuralclaw/mesh-peers.json"
 fi
 
+DISCORD_VOICE_ENABLED="$(to_bool "${NEURALCLAW_DISCORD_VOICE_ENABLED:-false}")"
+DISCORD_TOKEN="${NEURALCLAW_DISCORD_TOKEN:-}"
+
+if [[ "$DISCORD_VOICE_ENABLED" == "true" && -n "$DISCORD_TOKEN" ]]; then
+  echo "[runtime] starting Python gateway + Discord voice worker"
+  python /app/mesh_gateway.py &
+  GATEWAY_PID=$!
+  node /app/discord_voice_worker/index.js &
+  DISCORD_WORKER_PID=$!
+
+  cleanup() {
+    kill "$GATEWAY_PID" "$DISCORD_WORKER_PID" 2>/dev/null || true
+  }
+
+  trap cleanup INT TERM
+  wait -n "$GATEWAY_PID" "$DISCORD_WORKER_PID"
+  STATUS=$?
+  cleanup
+  wait "$GATEWAY_PID" "$DISCORD_WORKER_PID" 2>/dev/null || true
+  exit "$STATUS"
+fi
+
 exec python /app/mesh_gateway.py
