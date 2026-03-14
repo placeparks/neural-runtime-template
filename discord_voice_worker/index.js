@@ -2,6 +2,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { PassThrough, Readable } = require("stream");
+const WebSocket = require("ws");
 
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const {
@@ -41,6 +42,9 @@ const VOICE_REPLY_WITH_TEXT = /^(1|true|yes|on)$/i.test(
 const SILENCE_MS = Math.max(500, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_SILENCE_MS || "1400", 10) || 1400);
 const MIN_SEGMENT_MS = Math.max(400, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_MIN_MS || "900", 10) || 900);
 const MAX_SEGMENT_SECONDS = Math.max(5, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_MAX_SECONDS || "18", 10) || 18);
+const REALTIME_ENABLED = /^(1|true|yes|on)$/i.test(process.env.NEURALCLAW_DISCORD_REALTIME_ENABLED || "true");
+const REALTIME_MODEL = (process.env.NEURALCLAW_DISCORD_REALTIME_MODEL || process.env.NEURALCLAW_VOICE_REALTIME_MODEL || "gpt-4o-realtime-preview").trim();
+const REALTIME_VOICE = (process.env.NEURALCLAW_DISCORD_REALTIME_VOICE || process.env.NEURALCLAW_VOICE_REALTIME_VOICE || "coral").trim();
 
 if (!DISCORD_TOKEN) {
   console.error("[DiscordVoice] NEURALCLAW_DISCORD_TOKEN is not configured");
@@ -61,6 +65,18 @@ const client = new Client({
 const sessions = new Map();
 
 const STOP_COMMAND_RE = /\b(stop|pause|wait|hold on|hold up|quiet|be quiet|stop talking|shut up)\b/i;
+
+function buildRealtimeInstructions() {
+  const persona = (process.env.NEURALCLAW_VOICE_PERSONA || process.env.NEURALCLAW_PERSONA || "You are NeuralClaw, a helpful and intelligent AI assistant.").trim();
+  return [
+    persona,
+    "You are speaking live in a Discord voice call.",
+    "Sound natural, warm, concise, and human.",
+    "Keep replies short by default, usually 1 to 3 sentences.",
+    "If the user interrupts, stop and listen immediately.",
+    "Do not use markdown, lists, or emoji while speaking.",
+  ].join("\n\n");
+}
 
 function isJoinCommand(text) {
   return [
@@ -217,6 +233,192 @@ function pcmBytesForMs(ms) {
   return Math.floor(48000 * 2 * 2 * (ms / 1000));
 }
 
+function discordPcmToRealtimePcm(pcmBuffer) {
+  const frameCount = Math.floor(pcmBuffer.length / 4);
+  const out = Buffer.allocUnsafe(frameCount * 2);
+  let outOffset = 0;
+  for (let i = 0; i < frameCount; i += 2) {
+    const frameOffset = i * 4;
+    const left = pcmBuffer.readInt16LE(frameOffset);
+    const right = pcmBuffer.readInt16LE(frameOffset + 2);
+    const mono = Math.max(-32768, Math.min(32767, Math.round((left + right) / 2)));
+    out.writeInt16LE(mono, outOffset);
+    outOffset += 2;
+  }
+  return out.subarray(0, outOffset);
+}
+
+function realtimePcmToDiscordPcm(pcmBuffer) {
+  const sampleCount = Math.floor(pcmBuffer.length / 2);
+  const out = Buffer.allocUnsafe(sampleCount * 8);
+  let outOffset = 0;
+  for (let i = 0; i < sampleCount; i += 1) {
+    const sample = pcmBuffer.readInt16LE(i * 2);
+    for (let repeat = 0; repeat < 2; repeat += 1) {
+      out.writeInt16LE(sample, outOffset);
+      out.writeInt16LE(sample, outOffset + 2);
+      outOffset += 4;
+    }
+  }
+  return out;
+}
+
+function ensureRealtimePlaybackStream(session) {
+  if (session.realtimePlaybackStream) {
+    return session.realtimePlaybackStream;
+  }
+  const stream = new PassThrough();
+  const resource = createAudioResource(stream, { inputType: StreamType.Raw });
+  session.realtimePlaybackStream = stream;
+  console.log(`[DiscordVoice] realtime playback request guild=${session.guildId}`);
+  session.player.play(resource);
+  return stream;
+}
+
+function closeRealtimePlaybackStream(session, reason = "done") {
+  if (!session.realtimePlaybackStream) {
+    return;
+  }
+  console.log(`[DiscordVoice] realtime playback close guild=${session.guildId} reason=${reason}`);
+  try {
+    session.realtimePlaybackStream.end();
+  } catch (_) {}
+  session.realtimePlaybackStream = null;
+}
+
+function sendRealtimeEvent(session, payload) {
+  const ws = session.realtimeSocket;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  ws.send(JSON.stringify(payload));
+}
+
+function interruptRealtimeResponse(session, reason) {
+  interruptPlayback(session, reason);
+  closeRealtimePlaybackStream(session, reason);
+  sendRealtimeEvent(session, { type: "response.cancel" });
+}
+
+function handleRealtimeEvent(session, rawData) {
+  let event;
+  try {
+    event = JSON.parse(String(rawData));
+  } catch (err) {
+    console.warn(`[DiscordVoice] realtime parse error guild=${session.guildId}: ${err.message}`);
+    return;
+  }
+
+  const etype = event.type || "";
+  if (etype === "session.created" || etype === "session.updated") {
+    return;
+  }
+  if (etype === "conversation.item.input_audio_transcription.completed") {
+    const transcript = String(event.transcript || "").trim();
+    if (transcript) {
+      console.log(`[DiscordVoice] realtime transcript guild=${session.guildId} chars=${transcript.length}`);
+    }
+    return;
+  }
+  if (etype === "response.audio_transcript.done") {
+    const transcript = String(event.transcript || "").trim();
+    if (transcript && VOICE_REPLY_WITH_TEXT && session.controlChannelId) {
+      client.channels.fetch(session.controlChannelId).then((channel) => {
+        if (channel && channel.isTextBased()) {
+          return channel.send(transcript);
+        }
+      }).catch((err) => {
+        console.warn(`[DiscordVoice] realtime text echo failed guild=${session.guildId}: ${err.message}`);
+      });
+    }
+    return;
+  }
+  if (etype === "response.audio.delta") {
+    const delta = String(event.delta || "");
+    if (!delta) {
+      return;
+    }
+    const pcm24 = Buffer.from(delta, "base64");
+    const discordPcm = realtimePcmToDiscordPcm(pcm24);
+    ensureRealtimePlaybackStream(session).write(discordPcm);
+    return;
+  }
+  if (etype === "response.done" || etype === "response.audio.done") {
+    closeRealtimePlaybackStream(session, etype);
+    return;
+  }
+  if (etype === "input_audio_buffer.speech_started") {
+    interruptPlayback(session, "realtime_speech_started");
+    closeRealtimePlaybackStream(session, "speech_started");
+    return;
+  }
+  if (etype === "error") {
+    console.warn(`[DiscordVoice] realtime error guild=${session.guildId}: ${JSON.stringify(event.error || event)}`);
+  }
+}
+
+async function openRealtimeSession(session) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("No OpenAI key configured for Discord Realtime voice.");
+  }
+  const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`;
+  console.log(`[DiscordVoice] realtime connect guild=${session.guildId} model=${REALTIME_MODEL} voice=${REALTIME_VOICE}`);
+  const ws = new WebSocket(url, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1",
+    },
+  });
+
+  session.realtimeSocket = ws;
+
+  await new Promise((resolve, reject) => {
+    const onOpen = () => {
+      ws.off("error", onError);
+      resolve();
+    };
+    const onError = (err) => {
+      ws.off("open", onOpen);
+      reject(err);
+    };
+    ws.once("open", onOpen);
+    ws.once("error", onError);
+  });
+
+  ws.on("message", (data) => handleRealtimeEvent(session, data));
+  ws.on("close", () => {
+    console.log(`[DiscordVoice] realtime close guild=${session.guildId}`);
+    closeRealtimePlaybackStream(session, "socket_closed");
+    if (session.realtimeSocket === ws) {
+      session.realtimeSocket = null;
+    }
+  });
+  ws.on("error", (err) => {
+    console.warn(`[DiscordVoice] realtime socket error guild=${session.guildId}: ${err.message}`);
+  });
+
+  sendRealtimeEvent(session, {
+    type: "session.update",
+    session: {
+      turn_detection: {
+        type: "server_vad",
+        create_response: true,
+        interrupt_response: true,
+      },
+      input_audio_format: "pcm16",
+      output_audio_format: "pcm16",
+      voice: REALTIME_VOICE,
+      instructions: buildRealtimeInstructions(),
+      modalities: ["text", "audio"],
+      temperature: 0.8,
+      input_audio_transcription: {
+        model: TRANSCRIBE_MODEL,
+      },
+    },
+  });
+  console.log(`[DiscordVoice] realtime ready guild=${session.guildId}`);
+}
+
 async function mp3ToAudioResource(mp3Buffer) {
   console.log(`[DiscordVoice] resource probe start bytes=${mp3Buffer.length}`);
   const stream = new PassThrough();
@@ -303,6 +505,9 @@ function interruptPlayback(session, reason) {
 }
 
 async function processVoiceSegment(session, user, pcmBuffer) {
+  if (session.realtimeEnabled) {
+    return;
+  }
   if (!pcmBuffer.length || pcmBuffer.length < pcmBytesForMs(MIN_SEGMENT_MS)) {
     return;
   }
@@ -370,6 +575,15 @@ function subscribeToUser(session, userId) {
   });
 
   decoder.on("data", (chunk) => {
+    if (session.realtimeEnabled && session.realtimeSocket && session.realtimeSocket.readyState === WebSocket.OPEN) {
+      const realtimePcm = discordPcmToRealtimePcm(chunk);
+      if (realtimePcm.length > 0) {
+        sendRealtimeEvent(session, {
+          type: "input_audio_buffer.append",
+          audio: realtimePcm.toString("base64"),
+        });
+      }
+    }
     chunks.push(chunk);
     total += chunk.length;
     if (total >= maxBytes) {
@@ -381,6 +595,9 @@ function subscribeToUser(session, userId) {
     cleanup();
     const pcm = Buffer.concat(chunks, total);
     console.log(`[DiscordVoice] segment close guild=${session.guildId} user=${userId} pcm_bytes=${pcm.length}`);
+    if (session.realtimeEnabled) {
+      return;
+    }
     const user = await client.users.fetch(userId).catch(() => null);
     if (!user) {
       return;
@@ -448,19 +665,42 @@ async function joinVoice(message) {
     subscriptions: new Map(),
     queue: Promise.resolve(),
     playbackGeneration: 0,
+    realtimeEnabled: REALTIME_ENABLED,
+    realtimeSocket: null,
+    realtimePlaybackStream: null,
   };
   sessions.set(message.guild.id, session);
+
+  if (session.realtimeEnabled) {
+    try {
+      await openRealtimeSession(session);
+    } catch (err) {
+      sessions.delete(message.guild.id);
+      connection.destroy();
+      throw err;
+    }
+  }
 
   connection.receiver.speaking.on("start", (userId) => {
     if (userId === client.user.id) {
       return;
     }
-    interruptPlayback(session, `barge_in_${userId}`);
+    if (session.realtimeEnabled) {
+      interruptRealtimeResponse(session, `barge_in_${userId}`);
+    } else {
+      interruptPlayback(session, `barge_in_${userId}`);
+    }
     subscribeToUser(session, userId);
   });
 
   connection.on("stateChange", async (_, newState) => {
     if (newState.status === VoiceConnectionStatus.Destroyed || newState.status === VoiceConnectionStatus.Disconnected) {
+      if (session.realtimeSocket) {
+        try {
+          session.realtimeSocket.close();
+        } catch (_) {}
+      }
+      closeRealtimePlaybackStream(session, "connection_closed");
       sessions.delete(message.guild.id);
     }
   });
@@ -517,6 +757,11 @@ async function leaveVoice(message) {
   if (!session) {
     await message.channel.send("I'm not in a voice channel right now.");
     return;
+  }
+  if (session.realtimeSocket) {
+    try {
+      session.realtimeSocket.close();
+    } catch (_) {}
   }
   session.connection.destroy();
   sessions.delete(message.guild.id);

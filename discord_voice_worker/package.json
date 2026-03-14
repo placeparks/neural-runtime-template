@@ -10,6 +10,7 @@
     "discord.js": "^14.19.3",
     "opusscript": "^0.0.8",
     "prism-media": "^1.3.5",
-    "tweetnacl": "^1.0.3"
+    "tweetnacl": "^1.0.3",
+    "ws": "^8.18.1"
   }
 }
