@@ -295,6 +295,9 @@ function sendRealtimeEvent(session, payload) {
 }
 
 function interruptRealtimeResponse(session, reason) {
+  if (!session.realtimeResponseActive && !session.realtimePlaybackStream) {
+    return;
+  }
   interruptPlayback(session, reason);
   closeRealtimePlaybackStream(session, reason);
   if (session.realtimeResponseActive) {
@@ -357,8 +360,10 @@ function handleRealtimeEvent(session, rawData) {
     return;
   }
   if (etype === "input_audio_buffer.speech_started") {
-    interruptPlayback(session, "realtime_speech_started");
-    closeRealtimePlaybackStream(session, "speech_started");
+    if (session.realtimeResponseActive || session.realtimePlaybackStream) {
+      interruptPlayback(session, "realtime_speech_started");
+      closeRealtimePlaybackStream(session, "speech_started");
+    }
     return;
   }
   if (etype === "error") {
@@ -415,7 +420,7 @@ async function openRealtimeSession(session) {
     session: {
       turn_detection: {
         type: "server_vad",
-        create_response: true,
+        create_response: false,
         interrupt_response: true,
       },
       input_audio_format: "pcm16",
@@ -609,6 +614,16 @@ function subscribeToUser(session, userId) {
     const pcm = Buffer.concat(chunks, total);
     console.log(`[DiscordVoice] segment close guild=${session.guildId} user=${userId} pcm_bytes=${pcm.length}`);
     if (session.realtimeEnabled) {
+      if (pcm.length >= pcmBytesForMs(MIN_SEGMENT_MS) && session.realtimeSocket && session.realtimeSocket.readyState === WebSocket.OPEN) {
+        console.log(`[DiscordVoice] realtime commit guild=${session.guildId} user=${userId} bytes=${pcm.length}`);
+        sendRealtimeEvent(session, { type: "input_audio_buffer.commit" });
+        sendRealtimeEvent(session, {
+          type: "response.create",
+          response: {
+            modalities: ["audio", "text"],
+          },
+        });
+      }
       return;
     }
     const user = await client.users.fetch(userId).catch(() => null);
@@ -700,7 +715,9 @@ async function joinVoice(message) {
       return;
     }
     if (session.realtimeEnabled) {
-      interruptRealtimeResponse(session, `barge_in_${userId}`);
+      if (session.realtimeResponseActive || session.realtimePlaybackStream) {
+        interruptRealtimeResponse(session, `barge_in_${userId}`);
+      }
     } else {
       interruptPlayback(session, `barge_in_${userId}`);
     }
