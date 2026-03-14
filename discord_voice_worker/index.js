@@ -60,6 +60,8 @@ const client = new Client({
 
 const sessions = new Map();
 
+const STOP_COMMAND_RE = /\b(stop|pause|wait|hold on|hold up|quiet|be quiet|stop talking|shut up)\b/i;
+
 function isJoinCommand(text) {
   return [
     "join voice",
@@ -227,9 +229,14 @@ async function mp3ToAudioResource(mp3Buffer) {
 async function playSpeech(guildId, text) {
   const session = sessions.get(guildId);
   if (!session) {
-    return;
+    return { interrupted: false };
   }
+  const generation = session.playbackGeneration;
   const mp3 = await synthesizeSpeech(text);
+  if (generation !== session.playbackGeneration) {
+    console.log(`[DiscordVoice] playback skipped guild=${guildId} reason=interrupted_before_probe`);
+    return { interrupted: true };
+  }
   const resource = await mp3ToAudioResource(mp3);
   const player = session.player;
 
@@ -240,7 +247,7 @@ async function playSpeech(guildId, text) {
     };
     const onIdle = () => {
       cleanup();
-      resolve();
+      resolve({ interrupted: generation !== session.playbackGeneration });
     };
     const onError = (err) => {
       cleanup();
@@ -252,8 +259,9 @@ async function playSpeech(guildId, text) {
 
   console.log(`[DiscordVoice] playback request guild=${guildId}`);
   player.play(resource);
-  await done;
-  console.log(`[DiscordVoice] playback end guild=${guildId}`);
+  const result = await done;
+  console.log(`[DiscordVoice] playback end guild=${guildId} interrupted=${result.interrupted ? "true" : "false"}`);
+  return result;
 }
 
 async function enqueueSpeech(guildId, text) {
@@ -261,9 +269,14 @@ async function enqueueSpeech(guildId, text) {
   if (!session) {
     return;
   }
+  const generation = session.playbackGeneration;
   session.queue = session.queue.then(async () => {
-    await playSpeech(guildId, text);
-    if (VOICE_REPLY_WITH_TEXT && session.controlChannelId) {
+    if (!sessions.get(guildId) || generation !== session.playbackGeneration) {
+      console.log(`[DiscordVoice] queued reply dropped guild=${guildId} reason=interrupted_before_play`);
+      return;
+    }
+    const playback = await playSpeech(guildId, text);
+    if (!playback.interrupted && VOICE_REPLY_WITH_TEXT && session.controlChannelId) {
       const channel = await client.channels.fetch(session.controlChannelId).catch(() => null);
       if (channel && channel.isTextBased()) {
         await channel.send(text).catch((err) => {
@@ -277,6 +290,18 @@ async function enqueueSpeech(guildId, text) {
   await session.queue;
 }
 
+function interruptPlayback(session, reason) {
+  session.playbackGeneration += 1;
+  console.log(`[DiscordVoice] interrupt playback guild=${session.guildId} reason=${reason}`);
+  try {
+    if (session.player && session.player.state && session.player.state.status !== AudioPlayerStatus.Idle) {
+      session.player.stop(true);
+    }
+  } catch (err) {
+    console.warn(`[DiscordVoice] interrupt playback error guild=${session.guildId}: ${err.message}`);
+  }
+}
+
 async function processVoiceSegment(session, user, pcmBuffer) {
   if (!pcmBuffer.length || pcmBuffer.length < pcmBytesForMs(MIN_SEGMENT_MS)) {
     return;
@@ -286,6 +311,10 @@ async function processVoiceSegment(session, user, pcmBuffer) {
   console.log(
     `[DiscordVoice] inbound voice segment guild=${session.guildId} user=${user.id} transcript_len=${transcript.length}`
   );
+  if (STOP_COMMAND_RE.test(transcript)) {
+    interruptPlayback(session, "voice_stop_command");
+    return;
+  }
   const response = await callGateway(transcript, {
     authorId: String(user.id),
     authorName: user.displayName || user.username || `user-${user.id}`,
@@ -418,6 +447,7 @@ async function joinVoice(message) {
     player,
     subscriptions: new Map(),
     queue: Promise.resolve(),
+    playbackGeneration: 0,
   };
   sessions.set(message.guild.id, session);
 
@@ -425,6 +455,7 @@ async function joinVoice(message) {
     if (userId === client.user.id) {
       return;
     }
+    interruptPlayback(session, `barge_in_${userId}`);
     subscribeToUser(session, userId);
   });
 
