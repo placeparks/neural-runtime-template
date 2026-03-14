@@ -27,7 +27,7 @@ const TTS_MODEL = (process.env.NEURALCLAW_DISCORD_TTS_MODEL || "gpt-4o-mini-tts"
 const TTS_VOICE = (process.env.NEURALCLAW_DISCORD_TTS_VOICE || "alloy").trim();
 const TTS_INSTRUCTIONS = (
   process.env.NEURALCLAW_DISCORD_TTS_INSTRUCTIONS ||
-  "Speak naturally, warmly, and conversationally. Sound human and responsive."
+  "Speak naturally, warmly, and conversationally. Sound human, playful, emotionally expressive, and responsive. Be helpful without sounding submissive or robotic."
 ).trim();
 const TRANSCRIBE_MODEL = (process.env.NEURALCLAW_DISCORD_TRANSCRIBE_MODEL || "gpt-4o-transcribe").trim();
 const TRANSCRIBE_LANGUAGE = (process.env.NEURALCLAW_DISCORD_TRANSCRIBE_LANGUAGE || "en").trim();
@@ -43,7 +43,7 @@ const SILENCE_MS = Math.max(500, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_S
 const MIN_SEGMENT_MS = Math.max(400, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_MIN_MS || "900", 10) || 900);
 const MAX_SEGMENT_SECONDS = Math.max(5, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_MAX_SECONDS || "18", 10) || 18);
 const REALTIME_ENABLED = /^(1|true|yes|on)$/i.test(process.env.NEURALCLAW_DISCORD_REALTIME_ENABLED || "true");
-const REALTIME_MODEL = (process.env.NEURALCLAW_DISCORD_REALTIME_MODEL || process.env.NEURALCLAW_VOICE_REALTIME_MODEL || "gpt-4o-realtime-preview").trim();
+const REALTIME_MODEL = (process.env.NEURALCLAW_DISCORD_REALTIME_MODEL || process.env.NEURALCLAW_VOICE_REALTIME_MODEL || "gpt-realtime").trim();
 const REALTIME_VOICE = (process.env.NEURALCLAW_DISCORD_REALTIME_VOICE || process.env.NEURALCLAW_VOICE_REALTIME_VOICE || "coral").trim();
 
 if (!DISCORD_TOKEN) {
@@ -71,8 +71,12 @@ function buildRealtimeInstructions() {
   return [
     persona,
     "You are speaking live in a Discord voice call.",
-    "Sound natural, warm, concise, and human.",
+    "Sound natural, warm, concise, emotionally expressive, and human.",
     "Keep replies short by default, usually 1 to 3 sentences.",
+    "Have a distinct, likable personality. Be playful and lightly teasing at times when it feels natural, but never mean or dismissive.",
+    "You may laugh softly or react with warmth when it genuinely fits the moment, but do not overdo it or force catchphrases.",
+    "Be helpful and engaging, but do not be blindly agreeable. If the user is wrong, say so kindly, clearly, and confidently.",
+    "Act like a sharp, socially aware human conversation partner, not a scripted assistant.",
     "Always respond in English unless the user very clearly asks you to switch languages.",
     "If the audio is unclear, ask for a repeat in simple English.",
     "Do not infer another language from noisy or partial audio.",
