@@ -1,7 +1,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { Readable } = require("stream");
+const { PassThrough, Readable } = require("stream");
 
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const {
@@ -217,7 +217,8 @@ function pcmBytesForMs(ms) {
 
 async function mp3ToAudioResource(mp3Buffer) {
   console.log(`[DiscordVoice] resource probe start bytes=${mp3Buffer.length}`);
-  const stream = Readable.from(mp3Buffer);
+  const stream = new PassThrough();
+  stream.end(mp3Buffer);
   const probed = await demuxProbe(stream);
   console.log(`[DiscordVoice] resource probe success type=${probed.type}`);
   return createAudioResource(probed.stream, { inputType: probed.type });
