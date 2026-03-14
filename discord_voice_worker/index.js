@@ -2,8 +2,6 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { Readable } = require("stream");
-const { pipeline } = require("stream/promises");
-const { spawn } = require("child_process");
 
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const {
@@ -15,8 +13,8 @@ const {
   VoiceConnectionStatus,
   createAudioPlayer,
   createAudioResource,
+  demuxProbe,
 } = require("@discordjs/voice");
-const prism = require("prism-media");
 
 const DISCORD_TOKEN = (process.env.NEURALCLAW_DISCORD_TOKEN || "").trim();
 const OPENAI_API_KEY = (process.env.NEURALCLAW_VOICE_OPENAI_KEY || process.env.OPENAI_API_KEY || "").trim();
@@ -216,26 +214,12 @@ function pcmBytesForMs(ms) {
   return Math.floor(48000 * 2 * 2 * (ms / 1000));
 }
 
-async function mp3ToPcmResource(mp3Buffer) {
-  const ffmpeg = new prism.FFmpeg({
-    args: [
-      "-analyzeduration",
-      "0",
-      "-loglevel",
-      "0",
-      "-i",
-      "pipe:0",
-      "-f",
-      "s16le",
-      "-ar",
-      "48000",
-      "-ac",
-      "2",
-      "pipe:1",
-    ],
-  });
-  Readable.from(mp3Buffer).pipe(ffmpeg);
-  return createAudioResource(ffmpeg, { inputType: StreamType.Raw });
+async function mp3ToAudioResource(mp3Buffer) {
+  console.log(`[DiscordVoice] resource probe start bytes=${mp3Buffer.length}`);
+  const stream = Readable.from(mp3Buffer);
+  const probed = await demuxProbe(stream);
+  console.log(`[DiscordVoice] resource probe success type=${probed.type}`);
+  return createAudioResource(probed.stream, { inputType: probed.type });
 }
 
 async function playSpeech(guildId, text) {
@@ -244,7 +228,7 @@ async function playSpeech(guildId, text) {
     return;
   }
   const mp3 = await synthesizeSpeech(text);
-  const resource = await mp3ToPcmResource(mp3);
+  const resource = await mp3ToAudioResource(mp3);
   const player = session.player;
 
   const done = new Promise((resolve, reject) => {
@@ -264,7 +248,7 @@ async function playSpeech(guildId, text) {
     player.once("error", onError);
   });
 
-  console.log(`[DiscordVoice] playback start guild=${guildId}`);
+  console.log(`[DiscordVoice] playback request guild=${guildId}`);
   player.play(resource);
   await done;
   console.log(`[DiscordVoice] playback end guild=${guildId}`);
@@ -413,6 +397,14 @@ async function joinVoice(message) {
 
   const connection = await createReliableVoiceConnection(voiceChannel);
   const player = createAudioPlayer();
+  player.on("stateChange", (oldState, newState) => {
+    console.log(
+      `[DiscordVoice] player state guild=${message.guild.id} ${oldState.status} -> ${newState.status}`
+    );
+  });
+  player.on("error", (err) => {
+    console.warn(`[DiscordVoice] player error guild=${message.guild.id}: ${err.message}`);
+  });
   connection.subscribe(player);
 
   const session = {
