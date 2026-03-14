@@ -10,11 +10,11 @@ const {
   AudioPlayerStatus,
   EndBehaviorType,
   StreamType,
+  entersState,
+  joinVoiceChannel,
   VoiceConnectionStatus,
   createAudioPlayer,
   createAudioResource,
-  entersState,
-  joinVoiceChannel,
 } = require("@discordjs/voice");
 const prism = require("prism-media");
 
@@ -393,15 +393,7 @@ async function joinVoice(message) {
     }
   }
 
-  const connection = joinVoiceChannel({
-    channelId: voiceChannel.id,
-    guildId: voiceChannel.guild.id,
-    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-    selfDeaf: false,
-    selfMute: false,
-  });
-
-  await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+  const connection = await createReliableVoiceConnection(voiceChannel);
   const player = createAudioPlayer();
   connection.subscribe(player);
 
@@ -432,6 +424,49 @@ async function joinVoice(message) {
 
   console.log(`[DiscordVoice] voice session started guild=${message.guild.id} channel=${voiceChannel.id}`);
   await message.channel.send(`Joined voice channel \`${voiceChannel.name}\`. Speak normally and I'll answer in voice.`);
+}
+
+async function createReliableVoiceConnection(voiceChannel) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: voiceChannel.guild.id,
+      adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+    });
+
+    connection.on("stateChange", (oldState, newState) => {
+      console.log(
+        `[DiscordVoice] connection state guild=${voiceChannel.guild.id} ${oldState.status} -> ${newState.status}`
+      );
+    });
+
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 45_000);
+      return connection;
+    } catch (err) {
+      lastError = err;
+      const status = connection.state?.status || "unknown";
+      const detail = err?.message || String(err);
+      console.warn(
+        `[DiscordVoice] voice connect attempt ${attempt} failed guild=${voiceChannel.guild.id} status=${status}: ${detail}`
+      );
+
+      try {
+        connection.destroy();
+      } catch (_) {}
+
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
+      }
+    }
+  }
+
+  const detail = lastError?.message || String(lastError || "unknown error");
+  throw new Error(`Voice connection failed after retries: ${detail}`);
 }
 
 async function leaveVoice(message) {
