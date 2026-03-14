@@ -29,14 +29,19 @@ const TTS_INSTRUCTIONS = (
   process.env.NEURALCLAW_DISCORD_TTS_INSTRUCTIONS ||
   "Speak naturally, warmly, and conversationally. Sound human and responsive."
 ).trim();
-const TRANSCRIBE_MODEL = (process.env.NEURALCLAW_DISCORD_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe").trim();
+const TRANSCRIBE_MODEL = (process.env.NEURALCLAW_DISCORD_TRANSCRIBE_MODEL || "gpt-4o-transcribe").trim();
+const TRANSCRIBE_LANGUAGE = (process.env.NEURALCLAW_DISCORD_TRANSCRIBE_LANGUAGE || "en").trim();
+const TRANSCRIBE_PROMPT = (
+  process.env.NEURALCLAW_DISCORD_TRANSCRIBE_PROMPT ||
+  "The speaker is primarily speaking conversational English. Prefer a faithful transcription over paraphrasing."
+).trim();
 const VOICE_ENABLED = /^(1|true|yes|on)$/i.test(process.env.NEURALCLAW_DISCORD_VOICE_ENABLED || "false");
 const VOICE_REPLY_WITH_TEXT = /^(1|true|yes|on)$/i.test(
   process.env.NEURALCLAW_DISCORD_VOICE_REPLY_WITH_TEXT || "true"
 );
-const SILENCE_MS = Math.max(300, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_SILENCE_MS || "900", 10) || 900);
-const MIN_SEGMENT_MS = Math.max(200, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_MIN_MS || "500", 10) || 500);
-const MAX_SEGMENT_SECONDS = Math.max(3, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_MAX_SECONDS || "15", 10) || 15);
+const SILENCE_MS = Math.max(500, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_SILENCE_MS || "1400", 10) || 1400);
+const MIN_SEGMENT_MS = Math.max(400, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_MIN_MS || "900", 10) || 900);
+const MAX_SEGMENT_SECONDS = Math.max(5, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_MAX_SECONDS || "18", 10) || 18);
 
 if (!DISCORD_TOKEN) {
   console.error("[DiscordVoice] NEURALCLAW_DISCORD_TOKEN is not configured");
@@ -123,8 +128,15 @@ async function transcribeWavBytes(wavBuffer) {
 
   const form = new FormData();
   form.append("model", TRANSCRIBE_MODEL);
+  if (TRANSCRIBE_LANGUAGE) {
+    form.append("language", TRANSCRIBE_LANGUAGE);
+  }
+  if (TRANSCRIBE_PROMPT) {
+    form.append("prompt", TRANSCRIBE_PROMPT);
+  }
   form.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "discord-voice.wav");
 
+  console.log(`[DiscordVoice] transcription start bytes=${wavBuffer.length} model=${TRANSCRIBE_MODEL} language=${TRANSCRIBE_LANGUAGE || "auto"}`);
   const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
@@ -139,6 +151,7 @@ async function transcribeWavBytes(wavBuffer) {
   if (!text) {
     throw new Error("OpenAI transcription returned empty text.");
   }
+  console.log(`[DiscordVoice] transcription success chars=${text.length}`);
   return text;
 }
 
@@ -147,6 +160,7 @@ async function synthesizeSpeech(text) {
     throw new Error("No OpenAI key configured for Discord TTS.");
   }
   const clean = text.trim().slice(0, 4000);
+  console.log(`[DiscordVoice] tts start chars=${clean.length} model=${TTS_MODEL} voice=${TTS_VOICE}`);
   const resp = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: {
@@ -170,6 +184,7 @@ async function synthesizeSpeech(text) {
   if (!buf.length) {
     throw new Error("OpenAI speech returned empty audio.");
   }
+  console.log(`[DiscordVoice] tts success bytes=${buf.length}`);
   return buf;
 }
 
@@ -249,8 +264,10 @@ async function playSpeech(guildId, text) {
     player.once("error", onError);
   });
 
+  console.log(`[DiscordVoice] playback start guild=${guildId}`);
   player.play(resource);
   await done;
+  console.log(`[DiscordVoice] playback end guild=${guildId}`);
 }
 
 async function enqueueSpeech(guildId, text) {
@@ -348,6 +365,7 @@ function subscribeToUser(session, userId) {
   decoder.once("close", async () => {
     cleanup();
     const pcm = Buffer.concat(chunks, total);
+    console.log(`[DiscordVoice] segment close guild=${session.guildId} user=${userId} pcm_bytes=${pcm.length}`);
     const user = await client.users.fetch(userId).catch(() => null);
     if (!user) {
       return;
