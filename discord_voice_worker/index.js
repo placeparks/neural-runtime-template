@@ -297,7 +297,10 @@ function sendRealtimeEvent(session, payload) {
 function interruptRealtimeResponse(session, reason) {
   interruptPlayback(session, reason);
   closeRealtimePlaybackStream(session, reason);
-  sendRealtimeEvent(session, { type: "response.cancel" });
+  if (session.realtimeResponseActive) {
+    sendRealtimeEvent(session, { type: "response.cancel" });
+    session.realtimeResponseActive = false;
+  }
 }
 
 function handleRealtimeEvent(session, rawData) {
@@ -333,7 +336,12 @@ function handleRealtimeEvent(session, rawData) {
     }
     return;
   }
+  if (etype === "response.created") {
+    session.realtimeResponseActive = true;
+    return;
+  }
   if (etype === "response.audio.delta") {
+    session.realtimeResponseActive = true;
     const delta = String(event.delta || "");
     if (!delta) {
       return;
@@ -344,6 +352,7 @@ function handleRealtimeEvent(session, rawData) {
     return;
   }
   if (etype === "response.done" || etype === "response.audio.done") {
+    session.realtimeResponseActive = false;
     closeRealtimePlaybackStream(session, etype);
     return;
   }
@@ -353,6 +362,10 @@ function handleRealtimeEvent(session, rawData) {
     return;
   }
   if (etype === "error") {
+    if (event.error && event.error.code === "response_cancel_not_active") {
+      session.realtimeResponseActive = false;
+      return;
+    }
     console.warn(`[DiscordVoice] realtime error guild=${session.guildId}: ${JSON.stringify(event.error || event)}`);
   }
 }
@@ -668,6 +681,7 @@ async function joinVoice(message) {
     realtimeEnabled: REALTIME_ENABLED,
     realtimeSocket: null,
     realtimePlaybackStream: null,
+    realtimeResponseActive: false,
   };
   sessions.set(message.guild.id, session);
 
