@@ -15,6 +15,7 @@ const {
   createAudioResource,
   demuxProbe,
 } = require("@discordjs/voice");
+const prism = require("prism-media");
 
 const DISCORD_TOKEN = (process.env.NEURALCLAW_DISCORD_TOKEN || "").trim();
 const OPENAI_API_KEY = (process.env.NEURALCLAW_VOICE_OPENAI_KEY || process.env.OPENAI_API_KEY || "").trim();
