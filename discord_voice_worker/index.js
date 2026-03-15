@@ -66,6 +66,10 @@ const sessions = new Map();
 
 const STOP_COMMAND_RE = /\b(stop|pause|wait|hold on|hold up|quiet|be quiet|stop talking|shut up)\b/i;
 
+function idleForever() {
+  setInterval(() => {}, 60_000);
+}
+
 function buildRealtimeInstructions() {
   const persona = (process.env.NEURALCLAW_VOICE_PERSONA || process.env.NEURALCLAW_PERSONA || "You are NeuralClaw, a helpful and intelligent AI assistant.").trim();
   return [
@@ -872,6 +876,17 @@ async function main() {
 }
 
 main().catch((err) => {
+  const detail = err?.message || String(err || "unknown error");
+  if (/Used disallowed intents/i.test(detail)) {
+    console.error(
+      "[DiscordVoice] Discord rejected the requested intents. Enable Message Content Intent in the Discord Developer Portal for this bot, or disable Discord voice for this deployment. Worker will stay idle so the gateway can keep running."
+    );
+    try {
+      client.destroy();
+    } catch (_) {}
+    idleForever();
+    return;
+  }
   console.error("[DiscordVoice] fatal error:", err);
   process.exit(1);
 });
