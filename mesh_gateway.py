@@ -264,9 +264,17 @@ async def _patched_deliberative_reason(
     memory_ctx: Any,
     tools: list[Any] | None = None,
     conversation_history: list[dict[str, str]] | None = None,
+    extra_system_sections: list[str] | None = None,
 ) -> ConfidenceEnvelope:
     if not _looks_like_web_search_query(getattr(signal, "content", "")):
-        return await _ORIGINAL_DELIBERATE_REASON(self, signal, memory_ctx, tools, conversation_history)
+        return await _ORIGINAL_DELIBERATE_REASON(
+            self,
+            signal,
+            memory_ctx,
+            tools,
+            conversation_history,
+            extra_system_sections=extra_system_sections,
+        )
 
     web_tool = next((t for t in (tools or []) if getattr(t, "name", "") == "web_search"), None)
     if not web_tool:
@@ -304,7 +312,12 @@ async def _patched_deliberative_reason(
         source="reasoning.deliberate",
     )
 
-    messages = self._build_messages(signal, memory_ctx, conversation_history)
+    messages = self._build_messages(
+        signal,
+        memory_ctx,
+        conversation_history,
+        extra_system_sections=extra_system_sections,
+    )
     messages.append({
         "role": "system",
         "content": (

@@ -71,7 +71,11 @@ function idleForever() {
 }
 
 function buildRealtimeInstructions() {
-  const persona = (process.env.NEURALCLAW_VOICE_PERSONA || process.env.NEURALCLAW_PERSONA || "You are NeuralClaw, a helpful and intelligent AI assistant.").trim();
+  const persona = (
+    process.env.NEURALCLAW_VOICE_PERSONA ||
+    process.env.NEURALCLAW_PERSONA ||
+    "You are NeuralClaw, a self-evolving cognitive AI agent with persistent memory and tool use capabilities."
+  ).trim();
   return [
     persona,
     "You are speaking live in a Discord voice call.",

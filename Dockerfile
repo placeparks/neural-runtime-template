@@ -22,8 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python runtime dependencies at build time.
-# Pinned to 0.7.7 for the current SaaS/runtime integration.
-RUN pip install --no-cache-dir "neuralclaw==0.7.7" aiohttp
+# 0.8.0 is the first runtime we ship with persistent identity/vector memory and
+# the expanded capability surface enabled by default for new agents.
+RUN pip install --no-cache-dir "neuralclaw[voice,vector,google,microsoft]==0.8.0" aiohttp \
+    && python -m playwright install --with-deps chromium
 
 WORKDIR /app/discord_voice_worker
 COPY discord_voice_worker/package.json /app/discord_voice_worker/package.json
