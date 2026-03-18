@@ -42,7 +42,10 @@ const VOICE_REPLY_WITH_TEXT = /^(1|true|yes|on)$/i.test(
 const SILENCE_MS = Math.max(500, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_SILENCE_MS || "1400", 10) || 1400);
 const MIN_SEGMENT_MS = Math.max(400, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_MIN_MS || "900", 10) || 900);
 const MAX_SEGMENT_SECONDS = Math.max(5, parseInt(process.env.NEURALCLAW_DISCORD_VOICE_MAX_SECONDS || "18", 10) || 18);
-const REALTIME_ENABLED = /^(1|true|yes|on)$/i.test(process.env.NEURALCLAW_DISCORD_REALTIME_ENABLED || "true");
+// Default to the gateway-backed voice path so Discord voice shares the same
+// memory, identity, and capability-aware runtime as text chat. Realtime can
+// still be re-enabled explicitly via env when low latency matters more.
+const REALTIME_ENABLED = /^(1|true|yes|on)$/i.test(process.env.NEURALCLAW_DISCORD_REALTIME_ENABLED || "false");
 const REALTIME_MODEL = (process.env.NEURALCLAW_DISCORD_REALTIME_MODEL || process.env.NEURALCLAW_VOICE_REALTIME_MODEL || "gpt-realtime").trim();
 const REALTIME_VOICE = (process.env.NEURALCLAW_DISCORD_REALTIME_VOICE || process.env.NEURALCLAW_VOICE_REALTIME_VOICE || "coral").trim();
 
