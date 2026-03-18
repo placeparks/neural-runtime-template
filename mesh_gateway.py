@@ -1766,7 +1766,11 @@ class CompanionRelayManager:
             function=self.launch_app,
             parameters={
                 "command": {"type": "string", "description": "Executable or command to launch."},
-                "args": {"type": "array", "description": "Optional command arguments."},
+                "args": {
+                    "type": "array",
+                    "description": "Optional command arguments.",
+                    "items": {"type": "string"},
+                },
             },
         )
         self._gateway._skills.register_tool(
