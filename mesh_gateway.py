@@ -671,12 +671,15 @@ class MeshAwareGateway(NeuralClawGateway):
         self._mesh_router = MeshDelegateRouter()
         self._knowledge_max_chars = int(os.getenv("NEURALCLAW_KNOWLEDGE_MAX_INJECT_CHARS", "12000"))
         self._voice_manager: VoiceCallManager | None = None
+        self._companion_manager: CompanionRelayManager | None = None
         self._last_request_context: dict[str, str] | None = None
 
     async def initialize(self) -> None:
         await super().initialize()
         if self._voice_manager:
             self._voice_manager.register_tools()
+        if self._companion_manager:
+            self._companion_manager.register_tools()
 
     def _get_channel_type(self, msg: Any) -> str:
         """Override to honor metadata.source for Slack/Telegram/Discord."""
@@ -1442,6 +1445,128 @@ class VoiceCallManager:
             if call_state in {"completed", "busy", "failed", "no-answer", "canceled"}:
                 self._sessions.pop(session_id, None)
         return web.Response(status=204)
+
+
+class CompanionRelayManager:
+    def __init__(self, gateway: "MeshAwareGateway") -> None:
+        self._gateway = gateway
+        self._relay_url = os.getenv("NEURALCLAW_COMPANION_RELAY_URL", "").strip().rstrip("/")
+        self._shared_secret = os.getenv("NEURALCLAW_COMPANION_RELAY_SHARED_SECRET", "").strip()
+        self._agent_id = os.getenv("NEURALCLAW_AGENT_ID", "").strip()
+        self._timeout = max(5, int(os.getenv("NEURALCLAW_COMPANION_TASK_TIMEOUT", "45")))
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._relay_url and self._shared_secret and self._agent_id)
+
+    def register_tools(self) -> None:
+        if not self.enabled:
+            return
+        self._gateway._skills.register_tool(
+            name="companion_open_url",
+            description="Open a URL in the paired user's real local browser on their computer.",
+            function=self.open_url,
+            parameters={
+                "url": {"type": "string", "description": "The URL to open on the paired computer."},
+            },
+        )
+        self._gateway._skills.register_tool(
+            name="companion_search_web",
+            description="Open a web search in the paired user's local browser.",
+            function=self.search_web,
+            parameters={
+                "query": {"type": "string", "description": "The search query to run on the paired computer."},
+                "provider": {
+                    "type": "string",
+                    "description": "Search provider, typically 'google' or 'duckduckgo'.",
+                },
+            },
+        )
+        self._gateway._skills.register_tool(
+            name="companion_launch_app",
+            description="Launch an app or command on the paired user's computer.",
+            function=self.launch_app,
+            parameters={
+                "command": {"type": "string", "description": "Executable or command to launch."},
+                "args": {"type": "array", "description": "Optional command arguments."},
+            },
+        )
+        self._gateway._skills.register_tool(
+            name="companion_open_path",
+            description="Open a file or folder path on the paired user's computer.",
+            function=self.open_path,
+            parameters={
+                "path": {"type": "string", "description": "Local path on the paired computer."},
+            },
+        )
+        self._gateway._skills.register_tool(
+            name="companion_reveal_path",
+            description="Reveal a file or folder in the paired user's file explorer.",
+            function=self.reveal_path,
+            parameters={
+                "path": {"type": "string", "description": "Local path on the paired computer."},
+            },
+        )
+        self._gateway._skills.register_tool(
+            name="companion_notify",
+            description="Show a local desktop notification on the paired user's computer.",
+            function=self.notify,
+            parameters={
+                "title": {"type": "string", "description": "Notification title."},
+                "body": {"type": "string", "description": "Notification message body."},
+            },
+        )
+        logger.info("[Companion] Relay tools registered")
+
+    async def _execute(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.enabled:
+            return {"ok": False, "error": "companion relay is not configured"}
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-companion-secret": self._shared_secret,
+        }
+        body = {
+            "agentId": self._agent_id,
+            "action": action,
+            "payload": payload,
+            "timeoutMs": self._timeout * 1000,
+        }
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout + 5)) as session:
+                async with session.post(
+                    f"{self._relay_url}/api/execute",
+                    json=body,
+                    headers=headers,
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    if resp.status != 200:
+                        return {"ok": False, "error": str(data.get("error") or f"companion relay returned HTTP {resp.status}")}
+                    result = data.get("result")
+                    if isinstance(result, dict):
+                        return result
+                    return {"ok": True, "result": result}
+        except Exception as exc:
+            return {"ok": False, "error": f"companion relay request failed: {exc}"}
+
+    async def open_url(self, url: str) -> dict[str, Any]:
+        return await self._execute("browser.open_url", {"url": url})
+
+    async def search_web(self, query: str, provider: str = "google") -> dict[str, Any]:
+        return await self._execute("browser.search_query", {"query": query, "provider": provider})
+
+    async def launch_app(self, command: str, args: list[str] | None = None) -> dict[str, Any]:
+        return await self._execute("app.launch", {"command": command, "args": args or []})
+
+    async def open_path(self, path: str) -> dict[str, Any]:
+        return await self._execute("file.open_path", {"path": path})
+
+    async def reveal_path(self, path: str) -> dict[str, Any]:
+        return await self._execute("file.reveal_path", {"path": path})
+
+    async def notify(self, title: str, body: str) -> dict[str, Any]:
+        return await self._execute("system.notify", {"title": title, "body": body})
 
 
 # ---------------------------------------------------------------------------
@@ -2631,8 +2756,34 @@ async def _run_gateway() -> None:
                 "act as a focused, professional caller completing the stated task. "
                 "Do not use your usual greeting or ask 'How can I help?'. "
                 "Speak naturally in 1-3 short sentences. No emoji or markdown."
-            )
+        )
         config.persona = (config.persona or "") + voice_hint
+
+    companion_tools = [
+        "companion_open_url",
+        "companion_search_web",
+        "companion_launch_app",
+        "companion_open_path",
+        "companion_reveal_path",
+        "companion_notify",
+    ]
+    companion_enabled = bool(
+        os.getenv("NEURALCLAW_COMPANION_RELAY_URL", "").strip()
+        and os.getenv("NEURALCLAW_COMPANION_RELAY_SHARED_SECRET", "").strip()
+        and os.getenv("NEURALCLAW_AGENT_ID", "").strip()
+    )
+    if companion_enabled:
+        for tool_name in companion_tools:
+            if tool_name not in config.policy.allowed_tools:
+                config.policy.allowed_tools.append(tool_name)
+        companion_hint = (
+            "\n\nYou may have companion_* tools connected to the user's PAIRED COMPUTER. "
+            "Use companion_* tools when the user asks to open a real browser on their laptop, "
+            "launch local apps, reveal files, or do anything on their actual device. "
+            "Use browser_* tools for the hosted cloud browser running inside Railway. "
+            "If a companion action fails, explain that the paired computer is offline or unavailable."
+        )
+        config.persona = (config.persona or "") + companion_hint
 
     # Inject knowledge base hint into persona so the LLM knows to use read_file
     if _KNOWLEDGE_PATH.exists():
@@ -2646,6 +2797,7 @@ async def _run_gateway() -> None:
     gw = MeshAwareGateway(config)
     voice_manager = VoiceCallManager(gw)
     gw._voice_manager = voice_manager
+    gw._companion_manager = CompanionRelayManager(gw)
 
     for ch_config in config.channels:
         if not ch_config.enabled or not ch_config.token:
