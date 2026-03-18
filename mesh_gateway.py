@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import html
 import io
 import json
@@ -56,6 +57,24 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 _SEARCH_QUERY_RE = re.compile(
     r"\b(search|find|look up|google|browse|review|reviews|latest|news|reddit|trustpilot)\b",
+    re.IGNORECASE,
+)
+
+_ONBOARDING_SKIP_RE = re.compile(
+    r"^\s*(join|leave|stop|pause|search|find|look up|google|open|click|type|call|message|send|show|take)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_NAME_RE = re.compile(
+    r"\b(?:my name is|call me|you can call me|i am|i'm|im)\s+([A-Za-z][A-Za-z' -]{1,40})\b",
+    re.IGNORECASE,
+)
+_SHORT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z' -]{1,32}$")
+_PREFERENCE_RE = re.compile(
+    r"\b(?:i prefer|please call me|from now on call me|i like it when)\s+(.+)",
+    re.IGNORECASE,
+)
+_SUMMARY_RE = re.compile(
+    r"\b(?:i am a|i'm a|im a|i work on|i'm working on|im working on|i run|i build|i'm building|im building)\s+(.+)",
     re.IGNORECASE,
 )
 
@@ -673,6 +692,213 @@ class MeshAwareGateway(NeuralClawGateway):
         self._voice_manager: VoiceCallManager | None = None
         self._companion_manager: CompanionRelayManager | None = None
         self._last_request_context: dict[str, str] | None = None
+        self._control_base_url = os.getenv("NEURALCLAW_CONTROL_BASE_URL", "").strip().rstrip("/")
+        self._provisioner_secret = os.getenv("NEURALCLAW_PROVISIONER_SECRET", "").strip()
+
+    async def _peek_identity_model(self, platform: str, platform_user_id: str) -> Any | None:
+        store = getattr(self, "_identity", None)
+        db = getattr(store, "_db", None)
+        if not store or not db:
+            return None
+        try:
+            rows = await db.execute_fetchall(
+                """
+                SELECT m.user_id, m.display_name, m.platform_aliases_json,
+                       m.communication_style_json, m.active_projects_json,
+                       m.expertise_domains_json, m.language, m.timezone,
+                       m.preferences_json, m.last_seen, m.first_seen,
+                       m.session_count, m.message_count, m.notes
+                FROM user_aliases a
+                JOIN user_models m ON m.user_id = a.user_id
+                WHERE a.platform = ? AND a.platform_user_id = ?
+                """,
+                (platform, platform_user_id),
+            )
+            if not rows:
+                return None
+            return store._row_to_model(rows[0])
+        except Exception as exc:
+            logger.warning("[runtime] could not peek identity model: %s", exc)
+            return None
+
+    def _last_assistant_message(self, channel_id: str) -> str:
+        history = getattr(self, "_history", {}).get(channel_id, [])
+        for item in reversed(history):
+            if item.get("role") == "assistant":
+                return str(item.get("content") or "")
+        return ""
+
+    def _extract_preferred_name(self, text: str, channel_id: str) -> str | None:
+        content = (text or "").strip()
+        if not content:
+            return None
+
+        match = _EXPLICIT_NAME_RE.search(content)
+        if match:
+            value = re.sub(r"\s+", " ", match.group(1)).strip(" .,!?:;\"'")
+            if value:
+                return value.title()
+
+        last_assistant = self._last_assistant_message(channel_id).lower()
+        short = re.sub(r"^[^A-Za-z]+|[^A-Za-z' -]+$", "", content).strip()
+        if (
+            any(phrase in last_assistant for phrase in ("what should i call you", "your name", "what's your name"))
+            and _SHORT_NAME_RE.fullmatch(short)
+            and len(short.split()) <= 3
+        ):
+            return re.sub(r"\s+", " ", short).strip().title()
+        return None
+
+    def _should_prompt_for_intro(self, model: Any | None, content: str, channel_id: str) -> bool:
+        text = (content or "").strip()
+        if not text:
+            return False
+        if _ONBOARDING_SKIP_RE.match(text):
+            return False
+        if self._extract_preferred_name(text, channel_id):
+            return False
+        if not model:
+            return True
+        if str(getattr(model, "notes", "") or "").strip():
+            return False
+        if int(getattr(model, "message_count", 0) or 0) > 2:
+            return False
+        return True
+
+    def _extract_profile_payload(
+        self,
+        *,
+        content: str,
+        channel_id: str,
+        author_name: str,
+        model: Any | None,
+    ) -> dict[str, Any] | None:
+        text = (content or "").strip()
+        if not text:
+            return None
+
+        preferred_name = self._extract_preferred_name(text, channel_id)
+        preference_match = _PREFERENCE_RE.search(text)
+        summary_match = _SUMMARY_RE.search(text)
+        preference = (
+            preference_match.group(1).strip(" .,!?:;\"'") if preference_match else ""
+        )
+        summary = summary_match.group(1).strip(" .,!?:;\"'") if summary_match else ""
+
+        if not any([preferred_name, preference, summary]) and model and int(getattr(model, "message_count", 0) or 0) > 2:
+            return None
+
+        aliases: list[str] = []
+        current_name = str(getattr(model, "display_name", "") or "").strip()
+        clean_author = (author_name or "").strip()
+        if preferred_name and current_name and preferred_name.lower() != current_name.lower():
+            aliases.append(current_name)
+        if clean_author and preferred_name and clean_author.lower() != preferred_name.lower():
+            aliases.append(clean_author)
+
+        notes_parts: list[str] = []
+        if summary:
+            notes_parts.append(f"Shared context: {summary}")
+        if preference:
+            notes_parts.append(f"Preference: {preference}")
+
+        return {
+            "preferred_name": preferred_name or "",
+            "aliases": aliases,
+            "summary": summary or None,
+            "preferences": preference or None,
+            "notes": "\n".join(notes_parts).strip() or None,
+        }
+
+    async def _update_local_identity_memory(self, user_id: str, payload: dict[str, Any]) -> None:
+        if not getattr(self, "_identity", None) or not user_id:
+            return
+        model = await self._identity.get(user_id)
+        if not model:
+            return
+
+        updates: dict[str, Any] = {}
+        preferred_name = str(payload.get("preferred_name") or "").strip()
+        if preferred_name and preferred_name.lower() != model.display_name.lower():
+            updates["display_name"] = preferred_name
+
+        preference = str(payload.get("preferences") or "").strip()
+        if preference:
+            existing_rules = []
+            if isinstance(model.preferences, dict):
+                existing_rules = list(model.preferences.get("custom_rules", []) or [])
+            if preference not in existing_rules:
+                updates["preferences"] = {"custom_rules": [*existing_rules, preference]}
+
+        note_lines = [str(payload.get("notes") or "").strip()]
+        merged_note_lines = [line for line in note_lines if line]
+        if merged_note_lines:
+            existing_notes = str(model.notes or "").strip()
+            next_notes = existing_notes
+            for line in merged_note_lines:
+                if line.lower() not in existing_notes.lower():
+                    next_notes = f"{next_notes}\n{line}".strip() if next_notes else line
+            if next_notes != existing_notes:
+                updates["notes"] = next_notes
+
+        if updates:
+            await self._identity.update(user_id, updates)
+
+    async def _sync_people_memory(
+        self,
+        *,
+        agent_id: str,
+        platform: str,
+        platform_user_id: str,
+        author_name: str,
+        payload: dict[str, Any],
+        model: Any | None,
+    ) -> None:
+        if not (self._control_base_url and self._provisioner_secret and agent_id):
+            return
+
+        preferred_name = str(payload.get("preferred_name") or "").strip()
+        if not any([preferred_name, payload.get("preferences"), payload.get("summary"), model]):
+            return
+
+        first_seen = None
+        last_seen = None
+        if model:
+            if getattr(model, "first_seen", 0):
+                first_seen = dt.datetime.fromtimestamp(float(model.first_seen), tz=dt.timezone.utc).isoformat()
+            if getattr(model, "last_seen", 0):
+                last_seen = dt.datetime.fromtimestamp(float(model.last_seen), tz=dt.timezone.utc).isoformat()
+
+        url = f"{self._control_base_url}/api/internal/agents/{agent_id}/people/ingest"
+        body = {
+            "platform": platform,
+            "platformUserId": platform_user_id,
+            "displayName": author_name,
+            "preferredName": preferred_name or None,
+            "aliases": payload.get("aliases") or [],
+            "summary": payload.get("summary"),
+            "preferences": payload.get("preferences"),
+            "notes": payload.get("notes"),
+            "firstSeenAt": first_seen,
+            "lastSeenAt": last_seen or dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "x-provisioner-secret": self._provisioner_secret,
+        }
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+                async with session.post(url, json=body, headers=headers) as resp:
+                    if resp.status >= 400:
+                        preview = (await resp.text())[:300]
+                        logger.warning(
+                            "[runtime] people ingest failed (%s): %s",
+                            resp.status,
+                            preview,
+                        )
+        except Exception as exc:
+            logger.warning("[runtime] people ingest request failed: %s", exc)
 
     async def initialize(self) -> None:
         await super().initialize()
@@ -820,15 +1046,65 @@ class MeshAwareGateway(NeuralClawGateway):
                     f"KNOWLEDGE_CONTEXT:\n{snippet}\n\n"
                     f"USER_MESSAGE:\n{content}"
                 )
-        return await super().process_message(
-            content=resolved_content,
-            author_id=author_id,
-            author_name=author_name,
+        platform = channel_type_name.lower()
+        existing_model = await self._peek_identity_model(platform, author_id)
+        onboarding_suffix = ""
+        if self._should_prompt_for_intro(existing_model, content, channel_id):
+            onboarding_suffix = (
+                "\n\nYou may be meeting this person for the first time. "
+                "Before giving a long answer, ask one short, warm onboarding question to learn "
+                "what they prefer to be called, unless they already gave their name in this message "
+                "or the request is urgent. Keep it natural and low-pressure. "
+                "After you learn a preferred name or durable preference, remember it and use it later. "
+                "Do not say that you lack permanent memory when memory is enabled."
+            )
+
+        original_persona = self._config.persona or ""
+        if onboarding_suffix:
+            self._config.persona = original_persona + onboarding_suffix
+
+        try:
+            response = await super().process_message(
+                content=resolved_content,
+                author_id=author_id,
+                author_name=author_name,
+                channel_id=channel_id,
+                channel_type_name=channel_type_name,
+                message_metadata=message_metadata,
+                raw_message=raw_message,
+            )
+        finally:
+            self._config.persona = original_persona
+
+        current_model = await self._peek_identity_model(platform, author_id)
+        payload = self._extract_profile_payload(
+            content=content,
             channel_id=channel_id,
-            channel_type_name=channel_type_name,
-            message_metadata=message_metadata,
-            raw_message=raw_message,
+            author_name=author_name,
+            model=current_model,
         )
+        if current_model and payload:
+            await self._update_local_identity_memory(current_model.user_id, payload)
+            refreshed_model = await self._peek_identity_model(platform, author_id)
+            await self._sync_people_memory(
+                agent_id=os.getenv("NEURALCLAW_AGENT_ID", "").strip(),
+                platform=platform,
+                platform_user_id=author_id,
+                author_name=author_name,
+                payload=payload,
+                model=refreshed_model or current_model,
+            )
+        elif current_model and int(getattr(current_model, "message_count", 0) or 0) <= 2:
+            await self._sync_people_memory(
+                agent_id=os.getenv("NEURALCLAW_AGENT_ID", "").strip(),
+                platform=platform,
+                platform_user_id=author_id,
+                author_name=author_name,
+                payload={"preferred_name": "", "aliases": [], "summary": None, "preferences": None, "notes": None},
+                model=current_model,
+            )
+
+        return response
 
 
 async def _handle_health(request: web.Request) -> web.Response:
@@ -2784,6 +3060,12 @@ async def _run_gateway() -> None:
             "If a companion action fails, explain that the paired computer is offline or unavailable."
         )
         config.persona = (config.persona or "") + companion_hint
+
+    onboarding_hint = (
+        "\n\nWhen speaking with a new person you do not know well yet, learn their preferred name in a friendly, natural way and remember it. "
+        "If they share a stable preference or personal context worth remembering for future chats, keep that in memory and use it later."
+    )
+    config.persona = (config.persona or "") + onboarding_hint
 
     # Inject knowledge base hint into persona so the LLM knows to use read_file
     if _KNOWLEDGE_PATH.exists():
