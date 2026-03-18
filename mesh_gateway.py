@@ -1003,6 +1003,7 @@ class MeshAwareGateway(NeuralClawGateway):
         author_name: str = "User",
         channel_id: str = "cli",
         channel_type_name: str = "CLI",
+        media: list[dict[str, Any]] | None = None,
         message_metadata: dict[str, Any] | None = None,
         raw_message: Any = None,
     ) -> str:
@@ -1070,6 +1071,7 @@ class MeshAwareGateway(NeuralClawGateway):
                 author_name=author_name,
                 channel_id=channel_id,
                 channel_type_name=channel_type_name,
+                media=media,
                 message_metadata=message_metadata,
                 raw_message=raw_message,
             )
