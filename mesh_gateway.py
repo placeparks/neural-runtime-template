@@ -1798,6 +1798,21 @@ class CompanionRelayManager:
                 "body": {"type": "string", "description": "Notification message body."},
             },
         )
+        self._gateway._skills.register_tool(
+            name="companion_take_screenshot",
+            description=(
+                "Capture a screenshot from the paired user's real computer and return it as an image. "
+                "Use this when the user asks you to see their screen, inspect something on their laptop, "
+                "or send a screenshot back."
+            ),
+            function=self.take_screenshot,
+            parameters={
+                "monitor": {
+                    "type": "integer",
+                    "description": "Optional zero-based display index. Defaults to the primary display.",
+                },
+            },
+        )
         logger.info("[Companion] Relay tools registered")
 
     async def _execute(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1816,6 +1831,7 @@ class CompanionRelayManager:
         }
 
         try:
+            logger.info("[Companion] dispatch action=%s agent_id=%s", action, self._agent_id[:8] if self._agent_id else "unknown")
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout + 5)) as session:
                 async with session.post(
                     f"{self._relay_url}/api/execute",
@@ -1824,12 +1840,20 @@ class CompanionRelayManager:
                 ) as resp:
                     data = await resp.json(content_type=None)
                     if resp.status != 200:
+                        logger.warning(
+                            "[Companion] action=%s failed status=%s error=%s",
+                            action,
+                            resp.status,
+                            data.get("error"),
+                        )
                         return {"ok": False, "error": str(data.get("error") or f"companion relay returned HTTP {resp.status}")}
                     result = data.get("result")
+                    logger.info("[Companion] action=%s completed ok=%s", action, bool(isinstance(result, dict) and result.get("ok", True)))
                     if isinstance(result, dict):
                         return result
                     return {"ok": True, "result": result}
         except Exception as exc:
+            logger.warning("[Companion] action=%s request failed: %s", action, exc)
             return {"ok": False, "error": f"companion relay request failed: {exc}"}
 
     async def open_url(self, url: str) -> dict[str, Any]:
@@ -1849,6 +1873,9 @@ class CompanionRelayManager:
 
     async def notify(self, title: str, body: str) -> dict[str, Any]:
         return await self._execute("system.notify", {"title": title, "body": body})
+
+    async def take_screenshot(self, monitor: int = 0) -> dict[str, Any]:
+        return await self._execute("screen.capture", {"monitor": monitor})
 
 
 # ---------------------------------------------------------------------------
@@ -3048,6 +3075,7 @@ async def _run_gateway() -> None:
         "companion_open_path",
         "companion_reveal_path",
         "companion_notify",
+        "companion_take_screenshot",
     ]
     companion_enabled = bool(
         os.getenv("NEURALCLAW_COMPANION_RELAY_URL", "").strip()
@@ -3061,7 +3089,8 @@ async def _run_gateway() -> None:
         companion_hint = (
             "\n\nYou may have companion_* tools connected to the user's PAIRED COMPUTER. "
             "Use companion_* tools when the user asks to open a real browser on their laptop, "
-            "launch local apps, reveal files, or do anything on their actual device. "
+            "launch local apps, reveal files, capture a real screenshot from their device, "
+            "or do anything on their actual computer. "
             "Use browser_* tools for the hosted cloud browser running inside Railway. "
             "If a companion action fails, explain that the paired computer is offline or unavailable."
         )
