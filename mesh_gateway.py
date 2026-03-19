@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import wave
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -1117,6 +1118,86 @@ async def _handle_health(request: web.Request) -> web.Response:
         "mesh_enabled": mesh.enabled,
         "peers": len(mesh.peers),
     })
+
+
+def _control_request_allowed(request: web.Request, gw: MeshAwareGateway) -> bool:
+    expected = (getattr(gw, "_provisioner_secret", "") or "").strip()
+    if not expected:
+        return True
+    provided = str(request.headers.get("x-provisioner-secret", "")).strip()
+    return bool(provided and provided == expected)
+
+
+async def _handle_stats(request: web.Request) -> web.Response:
+    gw: MeshAwareGateway = request.app["gateway"]
+    if not _control_request_allowed(request, gw):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    stats = gw._get_dashboard_stats()
+    stats["uptime"] = f"{int(time.time() - gw._started_at)}s" if hasattr(gw, "_started_at") else "unknown"
+    stats["skills"] = getattr(gw._skills, "count", 0)
+    stats["tool_count"] = getattr(gw._skills, "tool_count", 0)
+    stats["channels"] = len(getattr(gw, "_channels", {}) or {})
+    stats["channel_names"] = list((getattr(gw, "_channels", {}) or {}).keys())
+    stats["companion_enabled"] = bool(getattr(gw, "_companion_manager", None) and gw._companion_manager.enabled)
+    stats["traceline_enabled"] = bool(getattr(gw, "_traceline", None))
+    stats["audit_enabled"] = bool(getattr(gw, "_audit", None))
+
+    if getattr(gw, "_traceline", None):
+        try:
+            trace_metrics = await gw._traceline.get_metrics()
+            stats.update(trace_metrics)
+            if "error_rate" in trace_metrics:
+                stats["success_rate"] = round(1.0 - float(trace_metrics.get("error_rate", 0.0) or 0.0), 3)
+            if "total_traces" in trace_metrics:
+                stats["interactions"] = int(trace_metrics.get("total_traces", 0) or 0)
+        except Exception as exc:
+            stats["traceline_error"] = str(exc)
+
+    if getattr(gw, "_audit", None):
+        try:
+            audit_stats = await gw._audit.stats()
+            stats["audit_total_records"] = int(audit_stats.get("total_records", 0) or 0)
+            stats["audit_denied_records"] = int(audit_stats.get("denied_records", 0) or 0)
+            stats["audit_denial_rate"] = float(audit_stats.get("denial_rate", 0.0) or 0.0)
+            stats["audit_top_tools"] = audit_stats.get("top_tools", [])
+        except Exception as exc:
+            stats["audit_error"] = str(exc)
+
+    return web.json_response(stats)
+
+
+async def _handle_traces(request: web.Request) -> web.Response:
+    gw: MeshAwareGateway = request.app["gateway"]
+    if not _control_request_allowed(request, gw):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    limit = max(1, min(int(request.query.get("limit", "20")), 100))
+    if not getattr(gw, "_traceline", None):
+        return web.json_response([])
+
+    try:
+        traces = await gw._traceline.query_traces(limit=limit)
+        return web.json_response([asdict(trace) for trace in traces])
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def _handle_audit(request: web.Request) -> web.Response:
+    gw: MeshAwareGateway = request.app["gateway"]
+    if not _control_request_allowed(request, gw):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    limit = max(1, min(int(request.query.get("limit", "20")), 100))
+    if not getattr(gw, "_audit", None):
+        return web.json_response({"records": [], "stats": {}})
+
+    try:
+        records = [record.to_dict() for record in gw._audit.get_recent(limit)]
+        stats = await gw._audit.stats()
+        return web.json_response({"records": records, "stats": stats})
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
 
 
 async def _handle_a2a_message(request: web.Request) -> web.Response:
@@ -3159,6 +3240,9 @@ async def _run_gateway() -> None:
     app["voice_manager"] = voice_manager
     app.add_routes([
         web.get("/health", _handle_health),
+        web.get("/api/stats", _handle_stats),
+        web.get("/api/traces", _handle_traces),
+        web.get("/api/audit", _handle_audit),
         web.get("/channels/whatsapp", _handle_whatsapp_status),
         web.post("/a2a/message", _handle_a2a_message),
         web.get("/voice/twilio/start", _handle_voice_start),
