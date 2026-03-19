@@ -100,6 +100,7 @@ TWILIO_ACCOUNT_SID="${TWILIO_ACCOUNT_SID:-}"
 TWILIO_AUTH_TOKEN="${TWILIO_AUTH_TOKEN:-}"
 TWILIO_PHONE_NUMBER="${TWILIO_PHONE_NUMBER:-}"
 DISCORD_VOICE_ENABLED_RAW="${NEURALCLAW_DISCORD_VOICE_ENABLED:-false}"
+TELEGRAM_TRUST_MODE="${NEURALCLAW_TELEGRAM_TRUST_MODE:-open}"
 DISCORD_TRUST_MODE="${NEURALCLAW_DISCORD_TRUST_MODE:-open}"
 SLACK_TRUST_MODE="${NEURALCLAW_SLACK_TRUST_MODE:-open}"
 PERSONA="${NEURALCLAW_PERSONA:-You are NeuralClaw, a self-evolving cognitive AI agent with persistent memory and tool use capabilities.}"
@@ -411,6 +412,7 @@ a2a_enabled = false
 
 [channels.telegram]
 enabled = true
+trust_mode = "${TELEGRAM_TRUST_MODE}"
 
 [channels.discord]
 enabled = true
