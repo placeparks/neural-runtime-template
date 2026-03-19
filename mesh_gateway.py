@@ -1970,6 +1970,27 @@ class CompanionRelayManager:
 
 
 class CronJobManager:
+    _WEEKDAY_MAP = {
+        "sun": "0",
+        "sunday": "0",
+        "mon": "1",
+        "monday": "1",
+        "tue": "2",
+        "tues": "2",
+        "tuesday": "2",
+        "wed": "3",
+        "weds": "3",
+        "wednesday": "3",
+        "thu": "4",
+        "thur": "4",
+        "thurs": "4",
+        "thursday": "4",
+        "fri": "5",
+        "friday": "5",
+        "sat": "6",
+        "saturday": "6",
+    }
+
     def __init__(self, gateway: "MeshAwareGateway") -> None:
         self._gateway = gateway
         self._control_base_url = os.getenv("NEURALCLAW_CONTROL_BASE_URL", "").strip().rstrip("/")
@@ -1982,6 +2003,67 @@ class CronJobManager:
     @property
     def enabled(self) -> bool:
         return bool(self._control_base_url and self._agent_id)
+
+    def register_tools(self) -> None:
+        if not self.enabled:
+            return
+
+        self._gateway._skills.register_tool(
+            name="create_schedule",
+            description=(
+                "Create a reminder or scheduled job for the current user. "
+                "Use this when the user asks to be reminded later or wants something to happen at a specific time."
+            ),
+            function=self.create_schedule,
+            parameters={
+                "name": {
+                    "type": "string",
+                    "description": "Short title for the schedule, e.g. 'Call John reminder'.",
+                },
+                "task": {
+                    "type": "string",
+                    "description": (
+                        "What should happen when the schedule runs. "
+                        "For reminders, phrase it as the message the user should receive."
+                    ),
+                },
+                "schedule_text": {
+                    "type": "string",
+                    "description": (
+                        "Human schedule phrase such as 'at 8pm', 'tomorrow at 9', "
+                        "'in 30 minutes', 'every day at 8', or 'every Monday at 9am'."
+                    ),
+                },
+                "cron_expression": {
+                    "type": "string",
+                    "description": "Optional raw cron expression if you already know it, e.g. '0 9 * * *'.",
+                },
+                "run_once_at": {
+                    "type": "string",
+                    "description": "Optional one-time ISO timestamp if you already know the exact time.",
+                },
+                "timezone": {
+                    "type": "string",
+                    "description": "IANA timezone such as 'Asia/Karachi'. Defaults to UTC if omitted.",
+                },
+                "delete_after_run": {
+                    "type": "boolean",
+                    "description": "If true, disable the job after a successful one-time run.",
+                },
+            },
+        )
+        self._gateway._skills.register_tool(
+            name="list_schedules",
+            description="List the current agent's scheduled jobs and recent statuses.",
+            function=self.list_schedules,
+            parameters={
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of schedules to return.",
+                },
+            },
+        )
+        logger.info("[Cron] scheduling tools registered")
 
     async def start(self) -> None:
         if not self.enabled or self._task:
@@ -2004,6 +2086,260 @@ class CronJobManager:
         if self._shared_secret:
             headers["x-provisioner-secret"] = self._shared_secret
         return headers
+
+    @staticmethod
+    def _default_timezone() -> str:
+        return os.getenv("NEURALCLAW_DEFAULT_TIMEZONE", "UTC").strip() or "UTC"
+
+    @staticmethod
+    def _clean_schedule_text(value: str) -> str:
+        return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+    @staticmethod
+    def _parse_clock(value: str) -> tuple[int, int]:
+        match = re.fullmatch(r"(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", value.strip().lower())
+        if not match:
+            raise ValueError("Could not understand the time. Use forms like '8pm', '08:30', or '9:15 am'.")
+        hour = int(match.group(1))
+        minute = int(match.group(2) or "0")
+        ampm = match.group(3)
+        if minute > 59:
+            raise ValueError("Minute must be between 0 and 59.")
+        if ampm:
+            if hour < 1 or hour > 12:
+                raise ValueError("12-hour times must use an hour from 1 to 12.")
+            if ampm == "pm" and hour != 12:
+                hour += 12
+            if ampm == "am" and hour == 12:
+                hour = 0
+        elif hour > 23:
+            raise ValueError("Hour must be between 0 and 23.")
+        return hour, minute
+
+    def _validate_timezone(self, timezone_name: str) -> ZoneInfo:
+        try:
+            return ZoneInfo(timezone_name)
+        except Exception as exc:
+            raise ValueError(f"Unknown timezone '{timezone_name}'. Use an IANA timezone like Asia/Karachi.") from exc
+
+    def _validate_cron_expression(self, expression: str) -> str:
+        normalized = re.sub(r"\s+", " ", expression.strip())
+        parts = normalized.split(" ")
+        if len(parts) != 5:
+            raise ValueError("Cron expressions must have 5 fields.")
+        self._parse_field(parts[0], 0, 59)
+        self._parse_field(parts[1], 0, 23)
+        self._parse_field(parts[2], 1, 31)
+        self._parse_field(parts[3], 1, 12)
+        self._parse_field(parts[4].replace("7", "0"), 0, 6)
+        return normalized
+
+    def _coerce_run_once_at(self, run_once_at: str, timezone_name: str) -> str:
+        tz = self._validate_timezone(timezone_name)
+        raw = run_once_at.strip()
+        if not raw:
+            raise ValueError("run_once_at is required.")
+        try:
+            parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("run_once_at must be a valid ISO datetime.") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=tz)
+        return parsed.astimezone(dt.timezone.utc).replace(second=0, microsecond=0).isoformat()
+
+    def _parse_schedule_text(self, schedule_text: str, timezone_name: str) -> dict[str, Any]:
+        text = self._clean_schedule_text(schedule_text)
+        if not text:
+            raise ValueError("A schedule is required.")
+
+        tz = self._validate_timezone(timezone_name)
+        now_local = dt.datetime.now(tz)
+
+        match = re.fullmatch(r"in (\d+) minute[s]?", text)
+        if match:
+            when = now_local + dt.timedelta(minutes=int(match.group(1)))
+            when = when.replace(second=0, microsecond=0)
+            return {"run_once_at": when.astimezone(dt.timezone.utc).isoformat(), "delete_after_run": True}
+
+        match = re.fullmatch(r"in (\d+) hour[s]?", text)
+        if match:
+            when = now_local + dt.timedelta(hours=int(match.group(1)))
+            when = when.replace(second=0, microsecond=0)
+            return {"run_once_at": when.astimezone(dt.timezone.utc).isoformat(), "delete_after_run": True}
+
+        match = re.fullmatch(r"(?:every day|daily)(?: at)? (.+)", text)
+        if match:
+            hour, minute = self._parse_clock(match.group(1))
+            return {"cron_expression": f"{minute} {hour} * * *", "delete_after_run": False}
+
+        match = re.fullmatch(r"every (\d{1,2}) minute[s]?", text)
+        if match:
+            step = max(1, min(59, int(match.group(1))))
+            return {"cron_expression": f"*/{step} * * * *", "delete_after_run": False}
+
+        match = re.fullmatch(r"every (\d{1,2}) hour[s]?", text)
+        if match:
+            step = max(1, min(23, int(match.group(1))))
+            return {"cron_expression": f"0 */{step} * * *", "delete_after_run": False}
+
+        match = re.fullmatch(r"every weekday(?:s)?(?: at)? (.+)", text)
+        if match:
+            hour, minute = self._parse_clock(match.group(1))
+            return {"cron_expression": f"{minute} {hour} * * 1-5", "delete_after_run": False}
+
+        match = re.fullmatch(r"every weekend(?:s)?(?: at)? (.+)", text)
+        if match:
+            hour, minute = self._parse_clock(match.group(1))
+            return {"cron_expression": f"{minute} {hour} * * 0,6", "delete_after_run": False}
+
+        match = re.fullmatch(r"every ([a-z]+)(?: at)? (.+)", text)
+        if match:
+            weekday = self._WEEKDAY_MAP.get(match.group(1))
+            if weekday is not None:
+                hour, minute = self._parse_clock(match.group(2))
+                return {"cron_expression": f"{minute} {hour} * * {weekday}", "delete_after_run": False}
+
+        match = re.fullmatch(r"(?:on )?(\d{4}-\d{2}-\d{2})(?: at)? (.+)", text)
+        if match:
+            hour, minute = self._parse_clock(match.group(2))
+            date_part = dt.date.fromisoformat(match.group(1))
+            when = dt.datetime.combine(date_part, dt.time(hour=hour, minute=minute), tzinfo=tz)
+            return {"run_once_at": when.astimezone(dt.timezone.utc).isoformat(), "delete_after_run": True}
+
+        match = re.fullmatch(r"(today|tomorrow)(?: at)? (.+)", text)
+        if match:
+            day_label = match.group(1)
+            hour, minute = self._parse_clock(match.group(2))
+            day_offset = 0 if day_label == "today" else 1
+            target_date = (now_local + dt.timedelta(days=day_offset)).date()
+            when = dt.datetime.combine(target_date, dt.time(hour=hour, minute=minute), tzinfo=tz)
+            if day_label == "today" and when <= now_local:
+                raise ValueError("That time has already passed today. Say 'tomorrow' or choose a later time.")
+            return {"run_once_at": when.astimezone(dt.timezone.utc).isoformat(), "delete_after_run": True}
+
+        try:
+            hour, minute = self._parse_clock(text)
+        except ValueError as exc:
+            raise ValueError(
+                "I couldn't understand that schedule. Try 'at 8pm', 'tomorrow at 9', "
+                "'in 30 minutes', 'every day at 8', or a cron expression."
+            ) from exc
+
+        when = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if when <= now_local:
+            when += dt.timedelta(days=1)
+        return {"run_once_at": when.astimezone(dt.timezone.utc).isoformat(), "delete_after_run": True}
+
+    @staticmethod
+    def _schedule_name(name: str, task: str) -> str:
+        cleaned = (name or "").strip()
+        if cleaned:
+            return cleaned[:120]
+        fallback = (task or "").strip()
+        return (fallback[:117] + "...") if len(fallback) > 120 else (fallback or "Scheduled task")
+
+    @staticmethod
+    def _build_task_prompt(task: str) -> str:
+        cleaned = (task or "").strip()
+        if not cleaned:
+            raise ValueError("task is required.")
+        return (
+            "This is a scheduled task that is firing now. "
+            "Carry it out and respond with the exact reminder or result the user should receive in this chat. "
+            "Be concise unless the task clearly requires more detail.\n\n"
+            f"SCHEDULED_TASK:\n{cleaned}"
+        )
+
+    async def create_schedule(
+        self,
+        name: str,
+        task: str,
+        schedule_text: str = "",
+        cron_expression: str = "",
+        run_once_at: str = "",
+        timezone: str = "",
+        delete_after_run: bool | None = None,
+    ) -> dict[str, Any]:
+        if not self.enabled:
+            return {"ok": False, "error": "scheduler is not enabled"}
+
+        timezone_name = (timezone or self._default_timezone()).strip() or "UTC"
+        self._validate_timezone(timezone_name)
+
+        normalized_cron = cron_expression.strip()
+        normalized_run_once = run_once_at.strip()
+        parsed: dict[str, Any] = {}
+        if normalized_cron and normalized_run_once:
+            return {"ok": False, "error": "Provide either cron_expression or run_once_at, not both."}
+        if normalized_cron:
+            parsed["cron_expression"] = self._validate_cron_expression(normalized_cron)
+        elif normalized_run_once:
+            parsed["run_once_at"] = self._coerce_run_once_at(normalized_run_once, timezone_name)
+            parsed["delete_after_run"] = True
+        else:
+            parsed = self._parse_schedule_text(schedule_text, timezone_name)
+
+        one_time = bool(parsed.get("run_once_at"))
+        delete_flag = bool(delete_after_run) if delete_after_run is not None else bool(parsed.get("delete_after_run") or one_time)
+        request_ctx = dict(getattr(self._gateway, "_last_request_context", None) or {})
+        payload = {
+            "name": self._schedule_name(name, task),
+            "prompt": self._build_task_prompt(task),
+            "cronExpression": parsed.get("cron_expression", ""),
+            "runOnceAt": parsed.get("run_once_at", ""),
+            "timezone": timezone_name,
+            "deleteAfterRun": delete_flag,
+            "enabled": True,
+            "deliveryChannel": request_ctx.get("source_channel") or None,
+            "deliveryChannelId": request_ctx.get("channel_id") or None,
+            "deliveryAuthorId": request_ctx.get("author_id") or None,
+            "deliveryAuthorName": request_ctx.get("author_name") or None,
+        }
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+                async with session.post(
+                    f"{self._control_base_url}/api/internal/agents/{self._agent_id}/cron",
+                    headers=self._headers(),
+                    json=payload,
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    if resp.status != 200:
+                        return {"ok": False, "error": data.get("error", f"schedule create failed ({resp.status})")}
+        except Exception as exc:
+            return {"ok": False, "error": f"schedule create failed: {exc}"}
+
+        job = data.get("job") if isinstance(data, dict) else None
+        schedule_value = payload.get("runOnceAt") or payload.get("cronExpression")
+        if isinstance(job, dict):
+            schedule_value = job.get("run_once_at") or job.get("cron_expression") or schedule_value
+        return {
+            "ok": True,
+            "job": job,
+            "message": f"Scheduled '{payload['name']}' for {schedule_value} ({timezone_name}).",
+        }
+
+    async def list_schedules(self, limit: int = 10) -> dict[str, Any]:
+        if not self.enabled:
+            return {"ok": False, "error": "scheduler is not enabled"}
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+                async with session.get(
+                    f"{self._control_base_url}/api/internal/agents/{self._agent_id}/cron",
+                    headers=self._headers(),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    if resp.status != 200:
+                        return {"ok": False, "error": data.get("error", f"schedule list failed ({resp.status})")}
+        except Exception as exc:
+            return {"ok": False, "error": f"schedule list failed: {exc}"}
+
+        jobs = data.get("jobs") if isinstance(data, dict) else []
+        if not isinstance(jobs, list):
+            jobs = []
+        jobs = jobs[: max(1, min(int(limit or 10), 50))]
+        return {"ok": True, "count": len(jobs), "jobs": jobs}
 
     @staticmethod
     def _parse_field(field: str, min_value: int, max_value: int) -> tuple[set[int], bool]:
@@ -2109,6 +2445,16 @@ class CronJobManager:
         except Exception as exc:
             logger.warning("[Cron] result sync failed for %s: %s", job_id, exc)
 
+    async def _deliver_result(self, job: dict[str, Any], response: str) -> None:
+        delivery_channel = str(job.get("delivery_channel") or "").strip()
+        delivery_channel_id = str(job.get("delivery_channel_id") or "").strip()
+        if not delivery_channel or not delivery_channel_id:
+            return
+        adapter = self._gateway._channels.get(delivery_channel)
+        if not adapter:
+            raise RuntimeError(f"Delivery channel '{delivery_channel}' is not connected.")
+        await adapter.send(delivery_channel_id, response)
+
     async def _execute_job(self, job: dict[str, Any], scheduled_for: str) -> None:
         job_id = str(job.get("id") or "").strip()
         prompt = str(job.get("prompt") or "").strip()
@@ -2135,6 +2481,8 @@ class CronJobManager:
                     "is_private": True,
                 },
             )
+            if response:
+                await self._deliver_result(job, response)
             await self._complete_job(job_id, status="completed", result_preview=response)
             logger.info("[Cron] completed job=%s", job_id[:8])
         except Exception as exc:
@@ -2148,12 +2496,25 @@ class CronJobManager:
             for job in jobs:
                 try:
                     timezone_name = str(job.get("timezone") or "UTC").strip() or "UTC"
-                    tz = ZoneInfo(timezone_name)
+                    tz = self._validate_timezone(timezone_name)
                     local_now = now_utc.astimezone(tz).replace(second=0, microsecond=0)
                     expression = str(job.get("cron_expression") or "").strip()
-                    if not expression or not self._matches(expression, local_now):
+                    run_once_at = str(job.get("run_once_at") or "").strip()
+                    scheduled_for = ""
+
+                    if expression:
+                        if not self._matches(expression, local_now):
+                            continue
+                        scheduled_for = local_now.astimezone(dt.timezone.utc).isoformat()
+                    elif run_once_at:
+                        scheduled_at = self._coerce_run_once_at(run_once_at, timezone_name)
+                        scheduled_dt = dt.datetime.fromisoformat(scheduled_at)
+                        if scheduled_dt > now_utc:
+                            continue
+                        scheduled_for = scheduled_at
+                    else:
                         continue
-                    scheduled_for = local_now.astimezone(dt.timezone.utc).isoformat()
+
                     if str(job.get("last_scheduled_for") or "") == scheduled_for:
                         continue
                     await self._execute_job(job, scheduled_for)
