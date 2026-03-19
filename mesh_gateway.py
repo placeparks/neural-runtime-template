@@ -910,6 +910,8 @@ class MeshAwareGateway(NeuralClawGateway):
             self._voice_manager.register_tools()
         if self._companion_manager:
             self._companion_manager.register_tools()
+        if self._cron_manager:
+            self._cron_manager.register_tools()
 
     def _get_channel_type(self, msg: Any) -> str:
         """Override to honor metadata.source for Slack/Telegram/Discord."""
