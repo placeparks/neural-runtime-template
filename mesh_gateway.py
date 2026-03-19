@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import datetime as dt
 import html
@@ -19,6 +20,7 @@ import wave
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiohttp import web
@@ -692,6 +694,7 @@ class MeshAwareGateway(NeuralClawGateway):
         self._knowledge_max_chars = int(os.getenv("NEURALCLAW_KNOWLEDGE_MAX_INJECT_CHARS", "12000"))
         self._voice_manager: VoiceCallManager | None = None
         self._companion_manager: CompanionRelayManager | None = None
+        self._cron_manager: CronJobManager | None = None
         self._last_request_context: dict[str, str] | None = None
         self._control_base_url = os.getenv("NEURALCLAW_CONTROL_BASE_URL", "").strip().rstrip("/")
         self._provisioner_secret = os.getenv("NEURALCLAW_PROVISIONER_SECRET", "").strip()
@@ -1008,6 +1011,7 @@ class MeshAwareGateway(NeuralClawGateway):
         message_metadata: dict[str, Any] | None = None,
         raw_message: Any = None,
     ) -> str:
+        is_cron_run = bool(channel_id.startswith("cron:") or ((message_metadata or {}).get("source") == "cron"))
         if not channel_id.startswith("voice:"):
             source_map = {
                 "TELEGRAM": "telegram",
@@ -1051,7 +1055,7 @@ class MeshAwareGateway(NeuralClawGateway):
         platform = channel_type_name.lower()
         existing_model = await self._peek_identity_model(platform, author_id)
         onboarding_suffix = ""
-        if self._should_prompt_for_intro(existing_model, content, channel_id):
+        if not is_cron_run and self._should_prompt_for_intro(existing_model, content, channel_id):
             onboarding_suffix = (
                 "\n\nYou may be meeting this person for the first time. "
                 "Before giving a long answer, ask one short, warm onboarding question to learn "
@@ -1078,6 +1082,9 @@ class MeshAwareGateway(NeuralClawGateway):
             )
         finally:
             self._config.persona = original_persona
+
+        if is_cron_run:
+            return response
 
         current_model = await self._peek_identity_model(platform, author_id)
         payload = self._extract_profile_payload(
@@ -1140,6 +1147,7 @@ async def _handle_stats(request: web.Request) -> web.Response:
     stats["channels"] = len(getattr(gw, "_channels", {}) or {})
     stats["channel_names"] = list((getattr(gw, "_channels", {}) or {}).keys())
     stats["companion_enabled"] = bool(getattr(gw, "_companion_manager", None) and gw._companion_manager.enabled)
+    stats["cron_enabled"] = bool(getattr(gw, "_cron_manager", None) and gw._cron_manager.enabled)
     stats["traceline_enabled"] = bool(getattr(gw, "_traceline", None))
     stats["audit_enabled"] = bool(getattr(gw, "_audit", None))
 
@@ -1959,6 +1967,203 @@ class CompanionRelayManager:
         return await self._execute("screen.capture", {"monitor": monitor})
 
 
+class CronJobManager:
+    def __init__(self, gateway: "MeshAwareGateway") -> None:
+        self._gateway = gateway
+        self._control_base_url = os.getenv("NEURALCLAW_CONTROL_BASE_URL", "").strip().rstrip("/")
+        self._shared_secret = os.getenv("NEURALCLAW_PROVISIONER_SECRET", "").strip()
+        self._agent_id = os.getenv("NEURALCLAW_AGENT_ID", "").strip()
+        self._poll_seconds = max(15, int(os.getenv("NEURALCLAW_CRON_POLL_SECONDS", "30")))
+        self._task: asyncio.Task[None] | None = None
+        self._stop_event = asyncio.Event()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._control_base_url and self._agent_id)
+
+    async def start(self) -> None:
+        if not self.enabled or self._task:
+            return
+        self._stop_event.clear()
+        self._task = asyncio.create_task(self._run_loop())
+        logger.info("[Cron] Scheduler started for agent %s", self._agent_id[:8] if self._agent_id else "unknown")
+
+    async def stop(self) -> None:
+        if not self._task:
+            return
+        self._stop_event.set()
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+        self._task = None
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self._shared_secret:
+            headers["x-provisioner-secret"] = self._shared_secret
+        return headers
+
+    @staticmethod
+    def _parse_field(field: str, min_value: int, max_value: int) -> tuple[set[int], bool]:
+        if field == "*":
+            return set(range(min_value, max_value + 1)), True
+
+        values: set[int] = set()
+        for chunk in field.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                raise ValueError("empty cron field")
+
+            step = 1
+            base = chunk
+            if "/" in chunk:
+                base, step_raw = chunk.split("/", 1)
+                step = int(step_raw)
+                if step <= 0:
+                    raise ValueError("cron step must be positive")
+
+            if base == "*":
+                start, end = min_value, max_value
+            elif "-" in base:
+                start_raw, end_raw = base.split("-", 1)
+                start, end = int(start_raw), int(end_raw)
+            else:
+                start = end = int(base)
+
+            if start < min_value or end > max_value or start > end:
+                raise ValueError("cron value out of range")
+
+            for value in range(start, end + 1, step):
+                values.add(value)
+
+        return values, False
+
+    def _matches(self, expression: str, when_local: dt.datetime) -> bool:
+        minute, hour, day, month, weekday = expression.split()
+        minute_values, _ = self._parse_field(minute, 0, 59)
+        hour_values, _ = self._parse_field(hour, 0, 23)
+        day_values, day_any = self._parse_field(day, 1, 31)
+        month_values, _ = self._parse_field(month, 1, 12)
+        weekday_values, weekday_any = self._parse_field(weekday.replace("7", "0"), 0, 6)
+
+        cron_weekday = (when_local.weekday() + 1) % 7
+        if when_local.minute not in minute_values or when_local.hour not in hour_values or when_local.month not in month_values:
+            return False
+
+        day_match = when_local.day in day_values
+        weekday_match = cron_weekday in weekday_values
+        if day_any and weekday_any:
+            return True
+        if day_any:
+            return weekday_match
+        if weekday_any:
+            return day_match
+        return day_match or weekday_match
+
+    async def _fetch_jobs(self) -> list[dict[str, Any]]:
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.get(
+                    f"{self._control_base_url}/api/internal/agents/{self._agent_id}/cron",
+                    headers=self._headers(),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    if resp.status != 200:
+                        logger.warning("[Cron] fetch failed status=%s error=%s", resp.status, data.get("error"))
+                        return []
+                    jobs = data.get("jobs")
+                    return jobs if isinstance(jobs, list) else []
+        except Exception as exc:
+            logger.warning("[Cron] fetch failed: %s", exc)
+            return []
+
+    async def _claim_job(self, job_id: str, scheduled_for: str) -> bool:
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.post(
+                    f"{self._control_base_url}/api/internal/agents/{self._agent_id}/cron/{job_id}/claim",
+                    headers=self._headers(),
+                    json={"scheduledFor": scheduled_for},
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    return bool(resp.status == 200 and data.get("claimed"))
+        except Exception as exc:
+            logger.warning("[Cron] claim failed for %s: %s", job_id, exc)
+            return False
+
+    async def _complete_job(self, job_id: str, *, status: str, result_preview: str | None = None, error: str | None = None) -> None:
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                await session.post(
+                    f"{self._control_base_url}/api/internal/agents/{self._agent_id}/cron/{job_id}/result",
+                    headers=self._headers(),
+                    json={
+                        "status": status,
+                        "resultPreview": (result_preview or "")[:800] or None,
+                        "error": (error or "")[:800] or None,
+                        "finishedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    },
+                )
+        except Exception as exc:
+            logger.warning("[Cron] result sync failed for %s: %s", job_id, exc)
+
+    async def _execute_job(self, job: dict[str, Any], scheduled_for: str) -> None:
+        job_id = str(job.get("id") or "").strip()
+        prompt = str(job.get("prompt") or "").strip()
+        name = str(job.get("name") or "Scheduled job").strip()
+        if not job_id or not prompt:
+            return
+
+        if not await self._claim_job(job_id, scheduled_for):
+            return
+
+        logger.info("[Cron] running job=%s name=%s scheduled_for=%s", job_id[:8], name, scheduled_for)
+        try:
+            response = await self._gateway.process_message(
+                content=prompt,
+                author_id="cron",
+                author_name="Scheduler",
+                channel_id=f"cron:{job_id}",
+                channel_type_name="CLI",
+                message_metadata={
+                    "source": "cron",
+                    "cron_job_id": job_id,
+                    "cron_job_name": name,
+                    "scheduled_for": scheduled_for,
+                    "is_private": True,
+                },
+            )
+            await self._complete_job(job_id, status="completed", result_preview=response)
+            logger.info("[Cron] completed job=%s", job_id[:8])
+        except Exception as exc:
+            logger.exception("[Cron] job=%s failed", job_id[:8])
+            await self._complete_job(job_id, status="failed", error=str(exc))
+
+    async def _run_loop(self) -> None:
+        while not self._stop_event.is_set():
+            jobs = await self._fetch_jobs()
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            for job in jobs:
+                try:
+                    timezone_name = str(job.get("timezone") or "UTC").strip() or "UTC"
+                    tz = ZoneInfo(timezone_name)
+                    local_now = now_utc.astimezone(tz).replace(second=0, microsecond=0)
+                    expression = str(job.get("cron_expression") or "").strip()
+                    if not expression or not self._matches(expression, local_now):
+                        continue
+                    scheduled_for = local_now.astimezone(dt.timezone.utc).isoformat()
+                    if str(job.get("last_scheduled_for") or "") == scheduled_for:
+                        continue
+                    await self._execute_job(job, scheduled_for)
+                except Exception as exc:
+                    logger.warning("[Cron] scheduler loop error for job=%s: %s", job.get("id"), exc)
+
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self._poll_seconds)
+            except asyncio.TimeoutError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # QRTrackingWhatsAppAdapter — direct Baileys bridge (OpenClaw pattern).
 #
@@ -2378,6 +2583,23 @@ class LocalDiscordAdapter(_ChannelAdapterBase):
                     return
 
             from neuralclaw.channels.protocol import ChannelMessage
+            media: list[dict[str, Any]] = []
+            for attachment in list(getattr(message, "attachments", []) or []):
+                content_type = str(getattr(attachment, "content_type", "") or "").lower()
+                filename = str(getattr(attachment, "filename", "") or "").lower()
+                if not (content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))):
+                    continue
+                try:
+                    blob = await attachment.read()
+                    if not blob:
+                        continue
+                    media.append({
+                        "type": "image",
+                        "mime": content_type or "image/png",
+                        "base64": base64.b64encode(bytes(blob)).decode("ascii"),
+                    })
+                except Exception as exc:
+                    logger.warning("[Discord] failed to read attachment: %s", exc)
 
             msg = ChannelMessage(
                 content=content,
@@ -2385,6 +2607,7 @@ class LocalDiscordAdapter(_ChannelAdapterBase):
                 author_name=message.author.display_name,
                 channel_id=str(message.channel.id),
                 raw=message,
+                media=media,
                 metadata={
                     "platform": "discord",
                     "source": "discord",
@@ -2424,6 +2647,20 @@ class LocalDiscordAdapter(_ChannelAdapterBase):
             channel = await self._client.fetch_channel(int(channel_id))
         if channel:
             await channel.send(content)
+
+    async def send_photo(self, channel_id: str, photo_bytes: bytes, caption: str = "") -> None:
+        if not self._client:
+            return
+        try:
+            import discord
+        except ImportError:
+            return
+        channel = self._client.get_channel(int(channel_id))
+        if channel is None:
+            channel = await self._client.fetch_channel(int(channel_id))
+        if channel:
+            file = discord.File(io.BytesIO(photo_bytes), filename="neuralclaw-image.png")
+            await channel.send(content=caption or None, file=file)
 
     def _is_join_voice_command(self, content: str) -> bool:
         return content in {
@@ -3196,6 +3433,7 @@ async def _run_gateway() -> None:
     voice_manager = VoiceCallManager(gw)
     gw._voice_manager = voice_manager
     gw._companion_manager = CompanionRelayManager(gw)
+    gw._cron_manager = CronJobManager(gw)
 
     for ch_config in config.channels:
         if not ch_config.enabled or not ch_config.token:
@@ -3256,11 +3494,15 @@ async def _run_gateway() -> None:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", mesh_port)
     await site.start()
+    if gw._cron_manager:
+        await gw._cron_manager.start()
 
     loop = asyncio.get_running_loop()
 
     async def _shutdown(sig_name: str) -> None:
         logger.info("[runtime] received %s — shutting down gracefully", sig_name)
+        if gw._cron_manager:
+            await gw._cron_manager.stop()
         await gw.stop()
         await runner.cleanup()
         loop.stop()
