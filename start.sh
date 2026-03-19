@@ -28,6 +28,41 @@ mkdir -p \
   "$SESSION_ROOT/claude" \
   "$SESSION_ROOT/browser"
 
+link_runtime_dir() {
+  local target="$1"
+  local link="$2"
+
+  if [[ "$target" == "$link" ]]; then
+    return
+  fi
+
+  mkdir -p "$target"
+
+  if [[ -L "$link" ]]; then
+    rm -f "$link"
+  elif [[ -d "$link" ]]; then
+    if [[ -n "$(ls -A "$link" 2>/dev/null)" ]]; then
+      cp -a "$link"/. "$target"/ 2>/dev/null || true
+    fi
+    rm -rf "$link"
+  elif [[ -e "$link" ]]; then
+    rm -f "$link"
+  fi
+
+  ln -s "$target" "$link"
+}
+
+link_runtime_dir "$DATA_ROOT" "$RUNTIME_HOME/data"
+link_runtime_dir "$LOG_ROOT" "$RUNTIME_HOME/logs"
+link_runtime_dir "$SESSION_ROOT" "$RUNTIME_HOME/sessions"
+
+export NEURALCLAW_CONFIG_DIR="$RUNTIME_HOME"
+export NEURALCLAW_CONFIG_FILE="$RUNTIME_HOME/config.toml"
+export NEURALCLAW_DATA_DIR="$DATA_ROOT"
+export NEURALCLAW_LOG_DIR="$LOG_ROOT"
+export NEURALCLAW_SESSION_DIR="$SESSION_ROOT"
+export NEURALCLAW_CHANNEL_BINDINGS_FILE="$DATA_ROOT/channel_bindings.json"
+
 # Prefer a persistent volume for WhatsApp session state.
 if [[ -z "${NEURALCLAW_WHATSAPP_SESSION_DIR:-}" && -d "/data" ]]; then
   export NEURALCLAW_WHATSAPP_SESSION_DIR="/data/whatsapp"
