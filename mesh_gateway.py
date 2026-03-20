@@ -471,51 +471,6 @@ async def _patched_deliberative_reason(
             self.name = name
             self.arguments = arguments
 
-    schedule_payload = _extract_schedule_request(content_text)
-    schedule_tool = next((t for t in selected_tools if getattr(t, "name", "") == "create_schedule"), None)
-    if schedule_payload and schedule_tool:
-        forced_schedule = await self._execute_tool_call(
-            _ForcedToolCall(getattr(signal, "id", "forced"), "create_schedule", schedule_payload),
-            selected_tools,
-            request_ctx,
-        )
-        if isinstance(forced_schedule, dict) and forced_schedule.get("error"):
-            return ConfidenceEnvelope(
-                response=f"I couldn't schedule that reminder: {forced_schedule['error']}",
-                confidence=0.0,
-                source="error",
-                uncertainty_factors=["schedule_failed"],
-            )
-        message = str((forced_schedule or {}).get("message") or "Scheduled that reminder.").strip()
-        return ConfidenceEnvelope(
-            response=message,
-            confidence=0.94,
-            source="tool_verified",
-            tool_calls_made=1,
-        )
-
-    screenshot_tool = next((t for t in selected_tools if getattr(t, "name", "") == "companion_take_screenshot"), None)
-    if _looks_like_screenshot_request(content_text) and screenshot_tool:
-        forced_capture = await self._execute_tool_call(
-            _ForcedToolCall(getattr(signal, "id", "forced"), "companion_take_screenshot", {"monitor": 0}),
-            selected_tools,
-            request_ctx,
-        )
-        if isinstance(forced_capture, dict) and forced_capture.get("error"):
-            return ConfidenceEnvelope(
-                response=f"I couldn't capture a screenshot right now: {forced_capture['error']}",
-                confidence=0.0,
-                source="error",
-                uncertainty_factors=["screenshot_failed"],
-            )
-        message = str((forced_capture or {}).get("message") or "I've captured your screen and shared it here.").strip()
-        return ConfidenceEnvelope(
-            response=message,
-            confidence=0.96,
-            source="tool_verified",
-            tool_calls_made=1,
-        )
-
     forced_search = None
     if _looks_like_web_search_query(content_text):
         web_tool = next((t for t in selected_tools if getattr(t, "name", "") == "web_search"), None)
@@ -1341,23 +1296,6 @@ class MeshAwareGateway(NeuralClawGateway):
                 f"{self._person_prompt_block(saved_person, author_name)}\n\n"
                 f"USER_MESSAGE:\n{resolved_content}"
             )
-        if not is_cron_run:
-            schedule_payload = _extract_schedule_request(content)
-            if schedule_payload and self._cron_manager and self._cron_manager.enabled:
-                scheduled = await self._cron_manager.create_schedule(
-                    task=schedule_payload["task"],
-                    schedule_text=schedule_payload["schedule_text"],
-                )
-                if isinstance(scheduled, dict) and scheduled.get("ok"):
-                    return str(scheduled.get("message") or "Scheduled that reminder.").strip()
-                if isinstance(scheduled, dict) and scheduled.get("error"):
-                    return _friendly_schedule_error(str(scheduled["error"]))
-            if _looks_like_screenshot_request(content) and self._companion_manager and self._companion_manager.enabled:
-                captured = await self._companion_manager.take_screenshot(monitor=0)
-                if isinstance(captured, dict) and captured.get("ok"):
-                    return str(captured.get("message") or "I've captured your screen and shared it here.").strip()
-                if isinstance(captured, dict) and captured.get("error"):
-                    return f"I couldn't capture a screenshot right now: {captured['error']}"
         existing_model = await self._peek_identity_model(platform, author_id)
         onboarding_suffix = ""
         if not is_cron_run and self._should_prompt_for_intro(existing_model, content, channel_id):
