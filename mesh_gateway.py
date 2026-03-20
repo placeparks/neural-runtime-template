@@ -2187,6 +2187,7 @@ class CompanionRelayManager:
         self._shared_secret = os.getenv("NEURALCLAW_COMPANION_RELAY_SHARED_SECRET", "").strip()
         self._agent_id = os.getenv("NEURALCLAW_AGENT_ID", "").strip()
         self._timeout = max(5, int(os.getenv("NEURALCLAW_COMPANION_TASK_TIMEOUT", "45")))
+        self._recent_screenshot_requests: dict[tuple[str, int], float] = {}
 
     @property
     def enabled(self) -> bool:
@@ -2330,14 +2331,26 @@ class CompanionRelayManager:
         return await self._execute("system.notify", {"title": title, "body": body})
 
     async def take_screenshot(self, monitor: int = 0) -> dict[str, Any]:
+        request_ctx = dict(getattr(self._gateway, "_last_request_context", None) or {})
+        channel_id = str(request_ctx.get("channel_id") or "").strip()
+        dedupe_key = (channel_id, int(monitor))
+        now = time.time()
+        if channel_id:
+            last_capture = float(self._recent_screenshot_requests.get(dedupe_key) or 0.0)
+            if now - last_capture < 3.0:
+                return {
+                    "ok": True,
+                    "message": "I've already captured and shared the latest screenshot here.",
+                    "deduped": True,
+                }
+            self._recent_screenshot_requests[dedupe_key] = now
+
         result = await self._execute("screen.capture", {"monitor": monitor})
         if not isinstance(result, dict) or not result.get("ok"):
             return result
 
         screenshot_b64 = str(result.get("screenshot_b64") or result.get("image_b64") or "").strip()
-        request_ctx = dict(getattr(self._gateway, "_last_request_context", None) or {})
         source_channel = str(request_ctx.get("source_channel") or "").strip()
-        channel_id = str(request_ctx.get("channel_id") or "").strip()
         if channel_id:
             self._gateway._last_screenshot_by_channel[channel_id] = {
                 "monitor": monitor,
