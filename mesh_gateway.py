@@ -1387,6 +1387,13 @@ class MeshAwareGateway(NeuralClawGateway):
                 )
 
         if not is_cron_run and self._companion_manager and self._companion_manager.enabled:
+            if _looks_like_screenshot_request(content):
+                requested_monitor = _extract_screenshot_monitor(content)
+                captured = await self._companion_manager.take_screenshot(monitor=0 if requested_monitor is None else requested_monitor)
+                if isinstance(captured, dict) and captured.get("ok"):
+                    return str(captured.get("message") or "I've captured your screen and shared the screenshot here.").strip()
+                if isinstance(captured, dict) and captured.get("error"):
+                    return f"I couldn't capture a screenshot right now: {captured['error']}"
             recent_assistant = _recent_assistant_message(getattr(self, "_history", {}).get(channel_id, []))
             requested_monitor = _extract_screenshot_monitor(content)
             if requested_monitor is not None and "screenshot" in recent_assistant.lower():
