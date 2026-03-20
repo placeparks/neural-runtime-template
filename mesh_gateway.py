@@ -4104,6 +4104,15 @@ async def _run_gateway() -> None:
         )
         config.persona = (config.persona or "") + companion_hint
 
+    cron_enabled = bool(
+        os.getenv("NEURALCLAW_CONTROL_BASE_URL", "").strip()
+        and os.getenv("NEURALCLAW_AGENT_ID", "").strip()
+    )
+    if cron_enabled:
+        for tool_name in ["create_schedule", "list_schedules"]:
+            if tool_name not in config.policy.allowed_tools:
+                config.policy.allowed_tools.append(tool_name)
+
     onboarding_hint = (
         "\n\nWhen speaking with a new person you do not know well yet, learn their preferred name in a friendly, natural way and remember it. "
         "If they share a stable preference or personal context worth remembering for future chats, keep that in memory and use it later."
