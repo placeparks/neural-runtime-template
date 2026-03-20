@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import asyncio
@@ -32,7 +32,7 @@ from neuralclaw.config import get_api_key, load_config
 from neuralclaw.gateway import NeuralClawGateway
 
 # ---------------------------------------------------------------------------
-# Emoji stripper — TTS engines read emoji as "hand wave sign" etc.
+# Emoji stripper â€” TTS engines read emoji as "hand wave sign" etc.
 # ---------------------------------------------------------------------------
 _EMOJI_RE = re.compile(
     "["
@@ -91,7 +91,7 @@ _REMINDER_RE = re.compile(
     re.IGNORECASE,
 )
 _REMINDER_AFTER_RE = re.compile(
-    r"^(?:please\s+)?remind\s+me\s+(?:in|after)\s+(?P<when>.+?)\s+to\s+(?P<task>.+)$",
+    r"^(?:please\s+)?remind\s+me\s+(?:in|after)\s+(?P<when>.+?)\s+(?:to|that)\s+(?P<task>.+)$",
     re.IGNORECASE,
 )
 
@@ -108,6 +108,12 @@ def _extract_schedule_request(text: str) -> dict[str, str] | None:
     content = (text or "").strip()
     if not content:
         return None
+    content = re.sub(
+        r"^(?:please\s+)?(?:i\s+want\s+you\s+to|can\s+you|could\s+you|would\s+you)\s+",
+        "",
+        content,
+        flags=re.IGNORECASE,
+    ).strip()
     match = _REMINDER_AFTER_RE.match(content)
     if match:
         task = match.group("task").strip(" .!")
@@ -587,7 +593,7 @@ if _KNOWLEDGE_PATH.exists():
         from neuralclaw.skills.builtins.file_ops import set_allowed_roots
         set_allowed_roots([_KNOWLEDGE_PATH.parent])
         logging.getLogger("mesh_gateway").info(
-            "[runtime] knowledge base available (%d bytes) — file_ops enabled",
+            "[runtime] knowledge base available (%d bytes) â€” file_ops enabled",
             _KNOWLEDGE_PATH.stat().st_size,
         )
     except Exception as _kb_err:  # pragma: no cover
@@ -810,7 +816,7 @@ class MeshDelegateRouter:
             known = [str(p.get("agentName") or p.get("name") or "") for p in self.peers]
             logger.warning("[MESH] Peer '%s' not found. Known peers: %s", target_name, known or ["(none)"])
             if not self.peers:
-                return None, "no mesh peers are configured — check NEURALCLAW_MESH_PEERS_JSON"
+                return None, "no mesh peers are configured â€” check NEURALCLAW_MESH_PEERS_JSON"
             return None, f"agent '{target_name}' is not in your mesh peer list (known: {', '.join(known)})"
 
         endpoint = str(peer.get("endpoint") or peer.get("meshEndpoint") or "").rstrip("/")
@@ -831,7 +837,7 @@ class MeshDelegateRouter:
         if shared:
             headers["x-mesh-secret"] = shared
 
-        logger.info("[MESH] Delegating to '%s' at %s — task: %s", target_name, endpoint, task[:80])
+        logger.info("[MESH] Delegating to '%s' at %s â€” task: %s", target_name, endpoint, task[:80])
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout)) as session:
                 async with session.post(f"{endpoint}/a2a/message", json=payload, headers=headers) as resp:
@@ -1268,7 +1274,7 @@ class MeshAwareGateway(NeuralClawGateway):
             result, error = await self._mesh_router.delegate(self._config.name, target, task)
             if result:
                 return result
-            # Delegation was explicitly attempted but failed — return the reason.
+            # Delegation was explicitly attempted but failed â€” return the reason.
             # Do NOT fall through to the local LLM; it would try to answer "ask X to ..."
             # as a normal query and fail (or give a nonsensical answer).
             return f"Could not delegate to '{target}': {error}"
@@ -1296,6 +1302,23 @@ class MeshAwareGateway(NeuralClawGateway):
                 f"{self._person_prompt_block(saved_person, author_name)}\n\n"
                 f"USER_MESSAGE:\n{resolved_content}"
             )
+        if not is_cron_run:
+            schedule_payload = _extract_schedule_request(content)
+            if schedule_payload and self._cron_manager and self._cron_manager.enabled:
+                scheduled = await self._cron_manager.create_schedule(
+                    task=schedule_payload["task"],
+                    schedule_text=schedule_payload["schedule_text"],
+                )
+                if isinstance(scheduled, dict) and scheduled.get("ok"):
+                    return str(scheduled.get("message") or "Scheduled that reminder.").strip()
+                if isinstance(scheduled, dict) and scheduled.get("error"):
+                    return f"I couldn't schedule that reminder: {scheduled['error']}"
+            if _looks_like_screenshot_request(content) and self._companion_manager and self._companion_manager.enabled:
+                captured = await self._companion_manager.take_screenshot(monitor=0)
+                if isinstance(captured, dict) and captured.get("ok"):
+                    return str(captured.get("message") or "I've captured your screen and shared it here.").strip()
+                if isinstance(captured, dict) and captured.get("error"):
+                    return f"I couldn't capture a screenshot right now: {captured['error']}"
         existing_model = await self._peek_identity_model(platform, author_id)
         onboarding_suffix = ""
         if not is_cron_run and self._should_prompt_for_intro(existing_model, content, channel_id):
@@ -1497,7 +1520,7 @@ async def _handle_voice_status(request: web.Request) -> web.Response:
 
 
 async def _handle_voice_ws(request: web.Request) -> web.WebSocketResponse:
-    """Twilio Media Streams WebSocket — bridges to OpenAI Realtime API."""
+    """Twilio Media Streams WebSocket â€” bridges to OpenAI Realtime API."""
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     manager: VoiceCallManager = request.app["voice_manager"]
@@ -1516,7 +1539,7 @@ class VoiceCallManager:
         self._twilio_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
         self._twilio_number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
         self._voice_name = os.getenv("TWILIO_VOICE", "Polly.Joanna").strip() or "Polly.Joanna"
-        # OpenAI Realtime — preferred key is NEURALCLAW_VOICE_OPENAI_KEY,
+        # OpenAI Realtime â€” preferred key is NEURALCLAW_VOICE_OPENAI_KEY,
         # falls back to OPENAI_API_KEY if the agent is already using OpenAI.
         self._realtime_key = (
             os.getenv("NEURALCLAW_VOICE_OPENAI_KEY", "").strip()
@@ -1729,7 +1752,7 @@ class VoiceCallManager:
                 content=(
                     "You are starting an outbound phone call right now. "
                     "Say a brief, natural greeting and immediately state the purpose of your call. "
-                    "Speak as a real person — one or two sentences, no emoji, no lists, no markdown. "
+                    "Speak as a real person â€” one or two sentences, no emoji, no lists, no markdown. "
                     f"Call purpose: {state['purpose']}"
                 ),
                 author_id="system",
@@ -1753,7 +1776,7 @@ class VoiceCallManager:
         if not state:
             return self._xml_response("<Say>Call session was not found.</Say><Hangup/>")
 
-        # Twilio may send GET (after an http→https redirect converts POST→GET)
+        # Twilio may send GET (after an httpâ†’https redirect converts POSTâ†’GET)
         # or POST directly. Read params from whichever is present.
         if request.method == "POST":
             params = await request.post()
@@ -1790,7 +1813,7 @@ class VoiceCallManager:
 
         content = (
             "You are on a live phone call. Respond naturally and conversationally. "
-            "Use short, clear sentences — 1 to 3 max per reply. "
+            "Use short, clear sentences â€” 1 to 3 max per reply. "
             "No emoji, no markdown, no bullet points. Sound warm and human. "
             "Do not introduce yourself again if you have already done so.\n"
             f"Call objective: {state['purpose']}\n"
@@ -1841,7 +1864,7 @@ class VoiceCallManager:
         return (
             f"{base}\n\n"
             f"Your task for this call: {state['purpose']}\n\n"
-            "Speak naturally and conversationally. Keep responses concise — 1 to 3 sentences. "
+            "Speak naturally and conversationally. Keep responses concise â€” 1 to 3 sentences. "
             "Be warm and human. Do not use markdown, bullet points, or emoji. "
             "When the task is complete or the conversation reaches a natural end, "
             "thank the person warmly and say goodbye."
@@ -1863,7 +1886,7 @@ class VoiceCallManager:
                 data = json.loads(msg.data)
                 ev = data.get("event")
                 if ev == "connected":
-                    continue  # protocol greeting — wait for "start"
+                    continue  # protocol greeting â€” wait for "start"
                 if ev == "start":
                     start = data.get("start", {})
                     stream_sid = data.get("streamSid") or start.get("streamSid")
@@ -1978,7 +2001,7 @@ class VoiceCallManager:
                     done.set()
                     break
         except Exception as exc:
-            logger.error("[Voice][Realtime] twilio→openai error: %s", exc)
+            logger.error("[Voice][Realtime] twilioâ†’openai error: %s", exc)
         finally:
             done.set()
             if not oai_ws.closed:
@@ -2032,7 +2055,7 @@ class VoiceCallManager:
                         await self._relay_update(state, f"[Voice] Callee: {text}")
 
                 elif etype == "input_audio_buffer.speech_started":
-                    # Callee interrupted — clear buffered audio so agent stops speaking
+                    # Callee interrupted â€” clear buffered audio so agent stops speaking
                     if ctx.get("stream_sid") and not twilio_ws.closed:
                         await twilio_ws.send_json({
                             "event": "clear",
@@ -2043,7 +2066,7 @@ class VoiceCallManager:
                     logger.error("[Voice][Realtime] OpenAI error: %s", event.get("error"))
 
         except Exception as exc:
-            logger.error("[Voice][Realtime] openai→twilio error: %s", exc)
+            logger.error("[Voice][Realtime] openaiâ†’twilio error: %s", exc)
         finally:
             done.set()
 
@@ -2221,10 +2244,24 @@ class CompanionRelayManager:
                 photo_bytes = base64.b64decode(raw)
                 adapter = self._gateway._channels.get(source_channel)
                 if adapter is not None:
-                    if hasattr(adapter, "send_photo"):
+                    if source_channel == "telegram" and getattr(adapter, "_app", None) and getattr(adapter._app, "bot", None):
+                        buf = io.BytesIO(photo_bytes)
+                        buf.name = "neuralclaw-screenshot.png"
+                        try:
+                            await adapter._app.bot.send_photo(
+                                chat_id=int(channel_id),
+                                photo=buf,
+                                caption="Here is the screenshot from your computer.",
+                            )
+                        except Exception:
+                            buf.seek(0)
+                            await adapter._app.bot.send_document(
+                                chat_id=int(channel_id),
+                                document=buf,
+                                caption="Here is the screenshot from your computer.",
+                            )
+                    elif hasattr(adapter, "send_photo"):
                         await adapter.send_photo(channel_id, photo_bytes, caption="Here is the screenshot from your computer.")
-                    elif source_channel == "telegram" and getattr(adapter, "_app", None) and getattr(adapter._app, "bot", None):
-                        await adapter._app.bot.send_photo(chat_id=int(channel_id), photo=photo_bytes, caption="Here is the screenshot from your computer.")
                     result.pop("screenshot_b64", None)
                     result.pop("image_b64", None)
                     result["message"] = "I've captured your screen and shared the screenshot here."
@@ -2521,8 +2558,8 @@ class CronJobManager:
 
     async def create_schedule(
         self,
-        name: str,
-        task: str,
+        name: str = "",
+        task: str = "",
         schedule_text: str = "",
         cron_expression: str = "",
         run_once_at: str = "",
@@ -2797,13 +2834,13 @@ class CronJobManager:
 
 
 # ---------------------------------------------------------------------------
-# QRTrackingWhatsAppAdapter — direct Baileys bridge (OpenClaw pattern).
+# QRTrackingWhatsAppAdapter â€” direct Baileys bridge (OpenClaw pattern).
 #
 # Runs a Node.js Baileys process as a subprocess. The bridge script is
 # written to /app/wa_bridge/bridge.mjs at startup; node_modules are
 # pre-installed there by the Docker build stage.
 #
-# No Evolution API, no Chromium — just Node.js + Baileys, same as OpenClaw.
+# No Evolution API, no Chromium â€” just Node.js + Baileys, same as OpenClaw.
 # ---------------------------------------------------------------------------
 
 _WA_BRIDGE_DIR = Path("/app/wa_bridge")
@@ -4132,7 +4169,7 @@ async def _run_gateway() -> None:
     loop = asyncio.get_running_loop()
 
     async def _shutdown(sig_name: str) -> None:
-        logger.info("[runtime] received %s — shutting down gracefully", sig_name)
+        logger.info("[runtime] received %s â€” shutting down gracefully", sig_name)
         if gw._cron_manager:
             await gw._cron_manager.stop()
         await gw.stop()
@@ -4154,3 +4191,4 @@ async def _run_gateway() -> None:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     asyncio.run(_run_gateway())
+
