@@ -90,6 +90,10 @@ _SUMMARY_RE = re.compile(
     r"\b(?:i am a|i'm a|im a|i work on|i'm working on|im working on|i run|i build|i'm building|im building)\s+(.+)",
     re.IGNORECASE,
 )
+_MEMORY_QUERY_RE = re.compile(
+    r"\b(what do you know about me|what do you remember about me|show what you know about me|tell me about me|memory summary|profile card|show this as|json)\b",
+    re.IGNORECASE,
+)
 _ROLE_HINT_WORDS = {
     "developer", "engineer", "founder", "student", "designer", "manager", "freelancer",
     "marketer", "writer", "consultant", "full", "stack", "frontend", "backend",
@@ -290,6 +294,50 @@ def _summarize_tool_result_for_model(result: Any) -> str:
 def _is_probable_role_phrase(value: str) -> bool:
     words = [part for part in re.findall(r"[a-z]+", value.lower()) if part]
     return bool(words) and any(word in _ROLE_HINT_WORDS for word in words)
+
+
+def _is_memory_question(text: str) -> bool:
+    return bool(_MEMORY_QUERY_RE.search(_extract_user_message_text(text)))
+
+
+def _looks_like_personal_fact_share(text: str, payload: dict[str, Any] | None) -> bool:
+    if not payload:
+        return False
+    content = _extract_user_message_text(text)
+    if not content or _is_memory_question(content):
+        return False
+    lowered = content.strip().lower()
+    if "?" in lowered:
+        return False
+    if _SEARCH_QUERY_RE.search(lowered) or _SCREENSHOT_QUERY_RE.search(lowered):
+        return False
+    if any(lowered.startswith(prefix) for prefix in ("show ", "search ", "find ", "open ", "take ", "remind ", "forge ")):
+        return False
+    return any(
+        str(payload.get(key) or "").strip()
+        for key in ("preferred_name", "preferences", "summary")
+    )
+
+
+def _personal_fact_ack(payload: dict[str, Any]) -> str:
+    preferred_name = str(payload.get("preferred_name") or "").strip()
+    preference = str(payload.get("preferences") or "").strip()
+    summary = str(payload.get("summary") or "").strip()
+    cleaned_preference_tail = ""
+    if preference:
+        cleaned_preference_tail = preference.split()[-1].strip(" .,!?:;'\"")
+
+    if preferred_name and (not preference and not summary):
+        return f"Noted. I'll call you {preferred_name}."
+    if preference and ("favorite color" in preference.lower()):
+        return f"Noted. I'll remember that your favorite color is {cleaned_preference_tail or preference}."
+    if preference and not summary:
+        return f"Noted. I'll keep that in mind."
+    if summary and not preference:
+        return "Noted. I'll keep that in mind for future help."
+    if summary or preference:
+        return "Noted. I'll remember that going forward."
+    return "Noted."
 
 
 async def _openai_web_search(query: str) -> dict[str, Any]:
@@ -1466,6 +1514,8 @@ class MeshAwareGateway(NeuralClawGateway):
             author_name=author_name,
             model=current_model,
         )
+        if payload and _looks_like_personal_fact_share(content, payload):
+            response = _personal_fact_ack(payload)
         if current_model and payload:
             await self._update_local_identity_memory(current_model.user_id, payload)
             refreshed_model = await self._peek_identity_model(platform, author_id)
