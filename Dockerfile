@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the published NeuralClaw runtime and the extras this Railway image uses.
-RUN pip install --no-cache-dir "neuralclaw[voice,vector,google,microsoft]==1.0.1" aiohttp \
+RUN pip install --no-cache-dir "neuralclaw[voice,vector,google,microsoft]==1.1.6" aiohttp \
     && python -m playwright install --with-deps chromium
 
 WORKDIR /app/discord_voice_worker

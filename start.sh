@@ -112,7 +112,7 @@ case "$PROVIDER" in
     OPENAI_BASE_URL="${NEURALCLAW_OPENAI_BASE_URL:-https://api.venice.ai/api/v1}"
     ;;
   g4f)
-    echo "[runtime] provider 'g4f' is no longer supported by neuralclaw 1.0.1. Use proxy, openrouter, local, or a token-backed provider instead." >&2
+    echo "[runtime] provider 'g4f' is no longer supported by neuralclaw 1.1.6. Use proxy, openrouter, local, or a token-backed provider instead." >&2
     exit 1
     ;;
   chatgpt_session) PROVIDER="chatgpt_token" ;;
