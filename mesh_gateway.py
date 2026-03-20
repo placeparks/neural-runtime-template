@@ -80,10 +80,130 @@ _SUMMARY_RE = re.compile(
     r"\b(?:i am a|i'm a|im a|i work on|i'm working on|im working on|i run|i build|i'm building|im building)\s+(.+)",
     re.IGNORECASE,
 )
+_ROLE_HINT_WORDS = {
+    "developer", "engineer", "founder", "student", "designer", "manager", "freelancer",
+    "marketer", "writer", "consultant", "full", "stack", "frontend", "backend",
+    "software", "product", "qa", "tester", "devops", "architect"
+}
+_SCREENSHOT_QUERY_RE = re.compile(r"\b(screenshot|screen shot|take a shot of|capture my screen|see my screen|share my screen)\b", re.IGNORECASE)
+_REMINDER_RE = re.compile(
+    r"^(?:please\s+)?remind\s+me(?:\s+to)?\s+(?P<task>.+?)\s+(?:at|on|in|after|tomorrow|today|every)\s+(?P<when>.+)$",
+    re.IGNORECASE,
+)
+_REMINDER_AFTER_RE = re.compile(
+    r"^(?:please\s+)?remind\s+me\s+(?:in|after)\s+(?P<when>.+?)\s+to\s+(?P<task>.+)$",
+    re.IGNORECASE,
+)
 
 
 def _looks_like_web_search_query(text: str) -> bool:
     return bool(_SEARCH_QUERY_RE.search(text or ""))
+
+
+def _looks_like_screenshot_request(text: str) -> bool:
+    return bool(_SCREENSHOT_QUERY_RE.search(text or ""))
+
+
+def _extract_schedule_request(text: str) -> dict[str, str] | None:
+    content = (text or "").strip()
+    if not content:
+        return None
+    match = _REMINDER_AFTER_RE.match(content)
+    if match:
+        task = match.group("task").strip(" .!")
+        when = f"in {match.group('when').strip()}"
+        if task and when:
+            return {"task": task, "schedule_text": when}
+    match = _REMINDER_RE.match(content)
+    if match:
+        task = match.group("task").strip(" .!")
+        keyword_match = re.search(r"\b(at|on|in|after|tomorrow|today|every)\b", content, re.IGNORECASE)
+        when = ""
+        if keyword_match:
+            when = content[keyword_match.start():].strip()
+        else:
+            when = match.group("when").strip()
+        if task and when:
+            return {"task": task, "schedule_text": when}
+    return None
+
+
+def _compact_text(value: str, limit: int = 1200) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _compact_history_messages(history: list[dict[str, Any]] | None, max_messages: int = 8, max_chars: int = 700) -> list[dict[str, Any]]:
+    if not history:
+        return []
+    trimmed = history[-max_messages:]
+    compact: list[dict[str, Any]] = []
+    for item in trimmed:
+        role = str(item.get("role") or "user")
+        content = item.get("content")
+        if isinstance(content, str):
+            compact.append({"role": role, "content": _compact_text(content, max_chars)})
+        else:
+            compact.append({"role": role, "content": content})
+    return compact
+
+
+def _score_tool(tool: Any, content: str) -> int:
+    name = str(getattr(tool, "name", "") or "").lower()
+    desc = str(getattr(tool, "description", "") or "").lower()
+    text = (content or "").lower()
+    score = 0
+    for token in re.findall(r"[a-z0-9_]+", text):
+        if len(token) < 3:
+            continue
+        if token in name:
+            score += 4
+        if token in desc:
+            score += 1
+    if "remind" in text and name in {"create_schedule", "list_schedules"}:
+        score += 50
+    if _looks_like_screenshot_request(text) and name == "companion_take_screenshot":
+        score += 50
+    if _looks_like_web_search_query(text) and name in {"web_search", "fetch_url", "companion_search_web"}:
+        score += 40
+    if any(word in text for word in ["open", "launch", "app", "browser", "laptop", "computer"]) and name.startswith("companion_"):
+        score += 20
+    return score
+
+
+def _select_relevant_tools(tools: list[Any] | None, content: str) -> list[Any] | None:
+    if not tools:
+        return None
+    scored = sorted(tools, key=lambda t: (_score_tool(t, content), str(getattr(t, "name", ""))), reverse=True)
+    chosen = [tool for tool in scored if _score_tool(tool, content) > 0][:18]
+    if not chosen:
+        preferred = {"web_search", "create_schedule", "list_schedules"}
+        chosen = [tool for tool in tools if str(getattr(tool, "name", "")) in preferred][:8]
+    return chosen or tools[:12]
+
+
+def _summarize_tool_result_for_model(result: Any) -> str:
+    if isinstance(result, dict):
+        compact = dict(result)
+        for key in list(compact.keys()):
+            lowered = key.lower()
+            if lowered in {"screenshot_b64", "base64", "image_b64", "image_base64", "binary", "bytes"}:
+                value = compact.pop(key)
+                compact[f"{key}_omitted"] = f"omitted {len(str(value))} chars of binary/base64 data"
+        if "results" in compact and isinstance(compact["results"], list):
+            compact["results"] = compact["results"][:3]
+        text = json.dumps(compact, ensure_ascii=False)
+        return _compact_text(text, 1800)
+    if isinstance(result, list):
+        return _compact_text(json.dumps(result[:3], ensure_ascii=False), 1200)
+    return _compact_text(str(result), 1200)
+
+
+def _is_probable_role_phrase(value: str) -> bool:
+    words = [part for part in re.findall(r"[a-z]+", value.lower()) if part]
+    return bool(words) and any(word in _ROLE_HINT_WORDS for word in words)
 
 
 async def _openai_web_search(query: str) -> dict[str, Any]:
@@ -288,69 +408,117 @@ async def _patched_deliberative_reason(
     conversation_history: list[dict[str, str]] | None = None,
     extra_system_sections: list[str] | None = None,
 ) -> ConfidenceEnvelope:
-    if not _looks_like_web_search_query(getattr(signal, "content", "")):
-        return await _ORIGINAL_DELIBERATE_REASON(
-            self,
-            signal,
-            memory_ctx,
-            tools,
-            conversation_history,
-            extra_system_sections=extra_system_sections,
-        )
-
-    web_tool = next((t for t in (tools or []) if getattr(t, "name", "") == "web_search"), None)
-    if not web_tool:
+    if not self._provider:
         return ConfidenceEnvelope(
-            response="Web search was requested, but this agent does not have the web_search tool enabled.",
+            response="I'm not configured with an LLM provider yet.",
             confidence=0.0,
             source="error",
-            uncertainty_factors=["web_search_unavailable"],
+            uncertainty_factors=["no_provider_configured"],
         )
 
-    request_ctx = RequestContext(request_id=getattr(signal, "id", "forced-web-search"))
+    content_text = str(getattr(signal, "content", "") or "")
+    selected_tools = _select_relevant_tools(tools, content_text) or (tools or [])
+    request_ctx = RequestContext(request_id=getattr(signal, "id", "runtime"))
 
     class _ForcedToolCall:
-        def __init__(self, signal_id: str, query: str) -> None:
-            self.id = f"forced-web-search-{signal_id}"
-            self.name = "web_search"
-            self.arguments = {"query": query, "max_results": 5}
+        def __init__(self, signal_id: str, name: str, arguments: dict[str, Any]) -> None:
+            self.id = f"forced-{name}-{signal_id}"
+            self.name = name
+            self.arguments = arguments
 
-    forced_search = await self._execute_tool_call(
-        _ForcedToolCall(getattr(signal, "id", "forced"), getattr(signal, "content", "")),
-        tools or [],
-        request_ctx,
-    )
-    if isinstance(forced_search, dict) and forced_search.get("error"):
-        return ConfidenceEnvelope(
-            response=f"Web search failed: {forced_search['error']}",
-            confidence=0.0,
-            source="error",
-            uncertainty_factors=["web_search_failed"],
+    schedule_payload = _extract_schedule_request(content_text)
+    schedule_tool = next((t for t in selected_tools if getattr(t, "name", "") == "create_schedule"), None)
+    if schedule_payload and schedule_tool:
+        forced_schedule = await self._execute_tool_call(
+            _ForcedToolCall(getattr(signal, "id", "forced"), "create_schedule", schedule_payload),
+            selected_tools,
+            request_ctx,
         )
+        if isinstance(forced_schedule, dict) and forced_schedule.get("error"):
+            return ConfidenceEnvelope(
+                response=f"I couldn't schedule that reminder: {forced_schedule['error']}",
+                confidence=0.0,
+                source="error",
+                uncertainty_factors=["schedule_failed"],
+            )
+        message = str((forced_schedule or {}).get("message") or "Scheduled that reminder.").strip()
+        return ConfidenceEnvelope(
+            response=message,
+            confidence=0.94,
+            source="tool_verified",
+            tool_calls_made=1,
+        )
+
+    screenshot_tool = next((t for t in selected_tools if getattr(t, "name", "") == "companion_take_screenshot"), None)
+    if _looks_like_screenshot_request(content_text) and screenshot_tool:
+        forced_capture = await self._execute_tool_call(
+            _ForcedToolCall(getattr(signal, "id", "forced"), "companion_take_screenshot", {"monitor": 0}),
+            selected_tools,
+            request_ctx,
+        )
+        if isinstance(forced_capture, dict) and forced_capture.get("error"):
+            return ConfidenceEnvelope(
+                response=f"I couldn't capture a screenshot right now: {forced_capture['error']}",
+                confidence=0.0,
+                source="error",
+                uncertainty_factors=["screenshot_failed"],
+            )
+        message = str((forced_capture or {}).get("message") or "I've captured your screen and shared it here.").strip()
+        return ConfidenceEnvelope(
+            response=message,
+            confidence=0.96,
+            source="tool_verified",
+            tool_calls_made=1,
+        )
+
+    forced_search = None
+    if _looks_like_web_search_query(content_text):
+        web_tool = next((t for t in selected_tools if getattr(t, "name", "") == "web_search"), None)
+        if web_tool:
+            forced_search = await self._execute_tool_call(
+                _ForcedToolCall(getattr(signal, "id", "forced"), "web_search", {"query": content_text, "max_results": 5}),
+                selected_tools,
+                request_ctx,
+            )
+            if isinstance(forced_search, dict) and forced_search.get("error"):
+                return ConfidenceEnvelope(
+                    response=f"Web search failed: {forced_search['error']}",
+                    confidence=0.0,
+                    source="error",
+                    uncertainty_factors=["web_search_failed"],
+                )
 
     await self._bus.publish(
         EventType.REASONING_STARTED,
-        {"signal_id": signal.id, "path": "deliberative", "tools_available": len(tools or [])},
+        {"signal_id": signal.id, "path": "deliberative", "tools_available": len(selected_tools)},
         source="reasoning.deliberate",
     )
 
-    messages = self._build_messages(
-        signal,
-        memory_ctx,
-        conversation_history,
-        extra_system_sections=extra_system_sections,
-    )
-    messages.append({
-        "role": "system",
-        "content": (
-            "Web search was executed for this request. Base your answer on these results. "
-            "If the results are sparse or inconclusive, say that clearly instead of pretending to browse.\n\n"
-            f"WEB_SEARCH_RESULTS:\n{json.dumps(forced_search, ensure_ascii=False)}"
-        ),
-    })
+    compact_history = _compact_history_messages(conversation_history)
+    try:
+        messages = self._build_messages(
+            signal,
+            memory_ctx,
+            compact_history,
+            extra_system_sections=extra_system_sections,
+        )
+    except TypeError:
+        messages = self._build_messages(signal, memory_ctx, compact_history)
+        if extra_system_sections:
+            messages.insert(1, {"role": "system", "content": "\n\n".join(extra_system_sections)})
 
-    tool_defs = [t.to_openai_format() for t in (tools or [])] if tools else None
-    tool_calls_made = 1
+    if forced_search is not None:
+        messages.append({
+            "role": "system",
+            "content": (
+                "Web search was executed for this request. Base your answer on these results. "
+                "If the results are sparse or inconclusive, say that clearly instead of pretending to browse.\n\n"
+                f"WEB_SEARCH_RESULTS:\n{_summarize_tool_result_for_model(forced_search)}"
+            ),
+        })
+
+    tool_defs = [t.to_openai_format() for t in selected_tools] if selected_tools else None
+    tool_calls_made = 1 if forced_search is not None else 0
     iterations = 0
 
     while iterations < self.MAX_ITERATIONS:
@@ -365,12 +533,12 @@ async def _patched_deliberative_reason(
                 uncertainty_factors=["provider_error"],
             )
 
-        if response.tool_calls and tools:
+        if response.tool_calls and selected_tools:
             for tc in response.tool_calls:
                 tool_calls_made += 1
-                result = await self._execute_tool_call(tc, tools, request_ctx)
+                result = await self._execute_tool_call(tc, selected_tools, request_ctx)
                 messages.append({"role": "assistant", "content": None, "tool_calls": [tc.to_dict()]})
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": _summarize_tool_result_for_model(result)})
             continue
 
         content = response.content or "I'm not sure how to respond to that."
@@ -398,7 +566,7 @@ async def _patched_deliberative_reason(
         return envelope
 
     return ConfidenceEnvelope(
-        response="I spent too many iterations trying to answer. Let me try a simpler approach â€” could you rephrase?",
+        response="I spent too many iterations trying to answer. Let me try a simpler approach - could you rephrase?",
         confidence=0.1,
         source="max_iterations",
         uncertainty_factors=["max_iterations_reached"],
@@ -740,7 +908,7 @@ class MeshAwareGateway(NeuralClawGateway):
         match = _EXPLICIT_NAME_RE.search(content)
         if match:
             value = re.sub(r"\s+", " ", match.group(1)).strip(" .,!?:;\"'")
-            if value:
+            if value and not _is_probable_role_phrase(value):
                 return value.title()
 
         last_assistant = self._last_assistant_message(channel_id).lower()
@@ -749,6 +917,7 @@ class MeshAwareGateway(NeuralClawGateway):
             any(phrase in last_assistant for phrase in ("what should i call you", "your name", "what's your name"))
             and _SHORT_NAME_RE.fullmatch(short)
             and len(short.split()) <= 3
+            and not _is_probable_role_phrase(short)
         ):
             return re.sub(r"\s+", " ", short).strip().title()
         return None
@@ -904,6 +1073,67 @@ class MeshAwareGateway(NeuralClawGateway):
         except Exception as exc:
             logger.warning("[runtime] people ingest request failed: %s", exc)
 
+    async def _load_saved_person_record(
+        self,
+        *,
+        agent_id: str,
+        platform: str,
+        platform_user_id: str,
+    ) -> dict[str, Any] | None:
+        if not (self._control_base_url and self._provisioner_secret and agent_id and platform and platform_user_id):
+            return None
+        url = (
+            f"{self._control_base_url}/api/internal/agents/{agent_id}/people"
+            f"?platform={platform}&platformUserId={platform_user_id}"
+        )
+        headers = {"x-provisioner-secret": self._provisioner_secret}
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = await resp.json(content_type=None)
+        except Exception as exc:
+            logger.warning("[runtime] people lookup failed: %s", exc)
+            return None
+        person = data.get("person") if isinstance(data, dict) else None
+        return person if isinstance(person, dict) else None
+
+    def _person_prompt_block(self, person: dict[str, Any], author_name: str) -> str:
+        aliases = [str(item).strip() for item in (person.get("aliases") or []) if str(item).strip()]
+        canonical = str(person.get("canonical_name") or "").strip()
+        display_name = canonical
+        profile_lines: list[str] = []
+        if canonical and _is_probable_role_phrase(canonical):
+            profile_lines.append(f"Known role/context: {canonical}")
+            display_name = aliases[0] if aliases else (author_name or canonical)
+        elif canonical:
+            display_name = canonical
+
+        if aliases:
+            profile_lines.append(f"Known aliases: {', '.join(aliases[:4])}")
+        if person.get("relationship"):
+            profile_lines.append(f"Relationship: {person['relationship']}")
+        if person.get("summary"):
+            profile_lines.append(f"Summary: {person['summary']}")
+        if person.get("preferences"):
+            profile_lines.append(f"Preferences: {person['preferences']}")
+        if person.get("notes"):
+            profile_lines.append(f"Notes: {_compact_text(str(person['notes']), 500)}")
+
+        identity_map = person.get("channel_identities") or {}
+        if isinstance(identity_map, dict) and identity_map:
+            parts = [f"{key}={value}" for key, value in list(identity_map.items())[:4] if str(value).strip()]
+            if parts:
+                profile_lines.append(f"Known channels: {', '.join(parts)}")
+
+        lead = f"KNOWN PERSON: The current user is {display_name}."
+        if profile_lines:
+            lead += "\n" + "\n".join(profile_lines)
+        lead += "\nUse this information confidently when the user asks what you know about them. Do not claim you have no memory if this block is present."
+        return lead
+
+
     async def initialize(self) -> None:
         await super().initialize()
         if self._voice_manager:
@@ -1055,6 +1285,17 @@ class MeshAwareGateway(NeuralClawGateway):
                     f"USER_MESSAGE:\n{content}"
                 )
         platform = channel_type_name.lower()
+        agent_id = os.getenv("NEURALCLAW_AGENT_ID", "").strip()
+        saved_person = await self._load_saved_person_record(
+            agent_id=agent_id,
+            platform=platform,
+            platform_user_id=author_id,
+        )
+        if saved_person:
+            resolved_content = (
+                f"{self._person_prompt_block(saved_person, author_name)}\n\n"
+                f"USER_MESSAGE:\n{resolved_content}"
+            )
         existing_model = await self._peek_identity_model(platform, author_id)
         onboarding_suffix = ""
         if not is_cron_run and self._should_prompt_for_intro(existing_model, content, channel_id):
@@ -1966,7 +2207,35 @@ class CompanionRelayManager:
         return await self._execute("system.notify", {"title": title, "body": body})
 
     async def take_screenshot(self, monitor: int = 0) -> dict[str, Any]:
-        return await self._execute("screen.capture", {"monitor": monitor})
+        result = await self._execute("screen.capture", {"monitor": monitor})
+        if not isinstance(result, dict) or not result.get("ok"):
+            return result
+
+        screenshot_b64 = str(result.get("screenshot_b64") or result.get("image_b64") or "").strip()
+        request_ctx = dict(getattr(self._gateway, "_last_request_context", None) or {})
+        source_channel = str(request_ctx.get("source_channel") or "").strip()
+        channel_id = str(request_ctx.get("channel_id") or "").strip()
+        if screenshot_b64 and source_channel and channel_id:
+            try:
+                raw = screenshot_b64.split(",", 1)[1] if screenshot_b64.startswith("data:image/") else screenshot_b64
+                photo_bytes = base64.b64decode(raw)
+                adapter = self._gateway._channels.get(source_channel)
+                if adapter is not None:
+                    if hasattr(adapter, "send_photo"):
+                        await adapter.send_photo(channel_id, photo_bytes, caption="Here is the screenshot from your computer.")
+                    elif source_channel == "telegram" and getattr(adapter, "_app", None) and getattr(adapter._app, "bot", None):
+                        await adapter._app.bot.send_photo(chat_id=int(channel_id), photo=photo_bytes, caption="Here is the screenshot from your computer.")
+                    result.pop("screenshot_b64", None)
+                    result.pop("image_b64", None)
+                    result["message"] = "I've captured your screen and shared the screenshot here."
+                    result["image_sent"] = True
+                    return result
+            except Exception as exc:
+                logger.warning("[Companion] screenshot delivery failed: %s", exc)
+
+        if screenshot_b64:
+            result["message"] = "I've captured the screenshot, but couldn't send the image back automatically in this channel."
+        return result
 
 
 class CronJobManager:
