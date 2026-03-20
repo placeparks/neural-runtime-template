@@ -471,6 +471,32 @@ async def _patched_deliberative_reason(
             self.name = name
             self.arguments = arguments
 
+    schedule_payload = _extract_schedule_request(content_text)
+    schedule_tool = next((t for t in selected_tools if getattr(t, "name", "") == "create_schedule"), None)
+    if schedule_payload and schedule_tool:
+        forced_schedule = await self._execute_tool_call(
+            _ForcedToolCall(getattr(signal, "id", "forced"), "create_schedule", schedule_payload),
+            selected_tools,
+            request_ctx,
+        )
+        if isinstance(forced_schedule, dict):
+            if forced_schedule.get("ok"):
+                message = str(forced_schedule.get("message") or "Scheduled that reminder.").strip()
+                return ConfidenceEnvelope(
+                    response=message,
+                    confidence=0.97,
+                    source="tool_verified",
+                    tool_calls_made=1,
+                )
+            if forced_schedule.get("error"):
+                return ConfidenceEnvelope(
+                    response=str(forced_schedule["error"]).strip(),
+                    confidence=0.2,
+                    source="error",
+                    uncertainty_factors=["schedule_failed"],
+                    tool_calls_made=1,
+                )
+
     forced_search = None
     if _looks_like_web_search_query(content_text):
         web_tool = next((t for t in selected_tools if getattr(t, "name", "") == "web_search"), None)
