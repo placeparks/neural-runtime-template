@@ -134,6 +134,45 @@ def _extract_schedule_request(text: str) -> dict[str, str] | None:
     return None
 
 
+def _friendly_schedule_error(error: str) -> str:
+    text = re.sub(r"\s+", " ", str(error or "").strip())
+    lowered = text.lower()
+    if any(
+        token in lowered
+        for token in [
+            "i couldn't understand that schedule",
+            "invalid cron expression",
+            "invalid timezone",
+            "provide either",
+            "time has already passed",
+        ]
+    ):
+        return (
+            "I need one more scheduling detail. Tell me the exact timing, like "
+            "'in 5 minutes', 'tomorrow at 8pm', or 'every day at 9am'."
+        )
+    if any(
+        token in lowered
+        for token in [
+            "schema cache",
+            "null value in column",
+            "not-null constraint",
+            "scheduler is not enabled",
+            "schedule create failed",
+            "job not found",
+            "column",
+        ]
+    ):
+        return (
+            "I understood the reminder, but the hosted scheduler is not ready right now. "
+            "I did not save the reminder."
+        )
+    return (
+        "I couldn't save that reminder yet. Tell me the timing again in a concrete form like "
+        "'in 5 minutes' or 'tomorrow at 8pm'."
+    )
+
+
 def _compact_text(value: str, limit: int = 1200) -> str:
     text = re.sub(r"\s+", " ", str(value or "").strip())
     if len(text) <= limit:
@@ -1312,7 +1351,7 @@ class MeshAwareGateway(NeuralClawGateway):
                 if isinstance(scheduled, dict) and scheduled.get("ok"):
                     return str(scheduled.get("message") or "Scheduled that reminder.").strip()
                 if isinstance(scheduled, dict) and scheduled.get("error"):
-                    return f"I couldn't schedule that reminder: {scheduled['error']}"
+                    return _friendly_schedule_error(str(scheduled["error"]))
             if _looks_like_screenshot_request(content) and self._companion_manager and self._companion_manager.enabled:
                 captured = await self._companion_manager.take_screenshot(monitor=0)
                 if isinstance(captured, dict) and captured.get("ok"):
