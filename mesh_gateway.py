@@ -96,6 +96,7 @@ _ROLE_HINT_WORDS = {
     "software", "product", "qa", "tester", "devops", "architect"
 }
 _SCREENSHOT_QUERY_RE = re.compile(r"\b(screenshot|screen shot|take a shot of|capture my screen|see my screen|share my screen)\b", re.IGNORECASE)
+_OPEN_LAST_SCREENSHOT_RE = re.compile(r"^\s*open\s+(?:it|the\s+screenshot|screenshot)\b", re.IGNORECASE)
 _REMINDER_RE = re.compile(
     r"^(?:please\s+)?remind\s+me(?:\s+to)?\s+(?P<task>.+?)\s+(?:at|on|in|after|tomorrow|today|every)\s+(?P<when>.+)$",
     re.IGNORECASE,
@@ -112,6 +113,10 @@ def _looks_like_web_search_query(text: str) -> bool:
 
 def _looks_like_screenshot_request(text: str) -> bool:
     return bool(_SCREENSHOT_QUERY_RE.search(_extract_user_message_text(text)))
+
+
+def _looks_like_open_last_screenshot_request(text: str) -> bool:
+    return bool(_OPEN_LAST_SCREENSHOT_RE.search(_extract_user_message_text(text)))
 
 
 def _extract_schedule_request(text: str) -> dict[str, str] | None:
@@ -910,6 +915,7 @@ class MeshAwareGateway(NeuralClawGateway):
         self._companion_manager: CompanionRelayManager | None = None
         self._cron_manager: CronJobManager | None = None
         self._last_request_context: dict[str, str] | None = None
+        self._last_screenshot_by_channel: dict[str, dict[str, Any]] = {}
         self._control_base_url = os.getenv("NEURALCLAW_CONTROL_BASE_URL", "").strip().rstrip("/")
         self._provisioner_secret = os.getenv("NEURALCLAW_PROVISIONER_SECRET", "").strip()
 
@@ -1318,6 +1324,15 @@ class MeshAwareGateway(NeuralClawGateway):
             # Do NOT fall through to the local LLM; it would try to answer "ask X to ..."
             # as a normal query and fail (or give a nonsensical answer).
             return f"Could not delegate to '{target}': {error}"
+
+        if not is_cron_run and _looks_like_open_last_screenshot_request(content):
+            screenshot_state = self._last_screenshot_by_channel.get(channel_id)
+            if screenshot_state:
+                return (
+                    "I understand `open it` means the screenshot I just sent. "
+                    "That screenshot was sent inline here in chat and was not saved as a file on your paired computer, "
+                    "so I cannot open it there yet."
+                )
 
         resolved_content = content
         if self._is_knowledge_query(content):
@@ -2261,6 +2276,14 @@ class CompanionRelayManager:
         request_ctx = dict(getattr(self._gateway, "_last_request_context", None) or {})
         source_channel = str(request_ctx.get("source_channel") or "").strip()
         channel_id = str(request_ctx.get("channel_id") or "").strip()
+        if channel_id:
+            self._gateway._last_screenshot_by_channel[channel_id] = {
+                "monitor": monitor,
+                "display_id": result.get("display_id"),
+                "width": result.get("width"),
+                "height": result.get("height"),
+                "captured_at": time.time(),
+            }
         if screenshot_b64 and source_channel and channel_id:
             try:
                 raw = screenshot_b64.split(",", 1)[1] if screenshot_b64.startswith("data:image/") else screenshot_b64
