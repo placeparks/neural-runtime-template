@@ -2356,14 +2356,18 @@ class CompanionRelayManager:
         if not isinstance(result, dict) or not result.get("ok"):
             return result
 
-        screenshot_b64 = str(result.get("screenshot_b64") or result.get("image_b64") or "").strip()
+        payload = result.get("result") if isinstance(result.get("result"), dict) else result
+        if not isinstance(payload, dict):
+            payload = result
+
+        screenshot_b64 = str(payload.get("screenshot_b64") or payload.get("image_b64") or "").strip()
         source_channel = str(request_ctx.get("source_channel") or "").strip()
         if channel_id:
             self._gateway._last_screenshot_by_channel[channel_id] = {
                 "monitor": monitor,
-                "display_id": result.get("display_id"),
-                "width": result.get("width"),
-                "height": result.get("height"),
+                "display_id": payload.get("display_id"),
+                "width": payload.get("width"),
+                "height": payload.get("height"),
                 "captured_at": time.time(),
             }
         if screenshot_b64 and source_channel and channel_id:
@@ -2390,8 +2394,8 @@ class CompanionRelayManager:
                             )
                     elif hasattr(adapter, "send_photo"):
                         await adapter.send_photo(channel_id, photo_bytes, caption="Here is the screenshot from your computer.")
-                    result.pop("screenshot_b64", None)
-                    result.pop("image_b64", None)
+                    payload.pop("screenshot_b64", None)
+                    payload.pop("image_b64", None)
                     result["message"] = "I've captured your screen and shared the screenshot here."
                     result["image_sent"] = True
                     return result
