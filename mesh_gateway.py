@@ -1658,7 +1658,25 @@ async def _handle_a2a_message(request: web.Request) -> web.Response:
         channel_type_name=channel_type_name,
         message_metadata=message_metadata,
     )
-    return web.json_response({"content": response, "payload": {"source": "mesh"}})
+    pending_media: list[dict[str, Any]] = []
+    raw_media = getattr(gw, "_pending_media", {}).pop(channel_id, [])
+    for item in raw_media:
+        if str(item.get("type") or "") != "image":
+            continue
+        data_bytes = item.get("data")
+        if not isinstance(data_bytes, (bytes, bytearray)):
+            continue
+        pending_media.append({
+            "type": "image",
+            "mime": str(item.get("mime") or "image/png"),
+            "filename": "neuralclaw-image.png",
+            "data_b64": base64.b64encode(bytes(data_bytes)).decode("ascii"),
+        })
+    return web.json_response({
+        "content": response,
+        "media": pending_media,
+        "payload": {"source": "mesh"},
+    })
 
 
 async def _handle_voice_start(request: web.Request) -> web.Response:

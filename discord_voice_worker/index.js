@@ -4,7 +4,7 @@ const path = require("path");
 const { PassThrough, Readable } = require("stream");
 const WebSocket = require("ws");
 
-const { Client, GatewayIntentBits, Partials } = require("discord.js");
+const { Client, GatewayIntentBits, Partials, AttachmentBuilder } = require("discord.js");
 const {
   AudioPlayerStatus,
   EndBehaviorType,
@@ -153,7 +153,38 @@ async function callGateway(content, meta) {
     throw new Error(`gateway request failed (${resp.status}): ${raw.slice(0, 300)}`);
   }
   const data = JSON.parse(raw);
-  return String(data.content || "").trim();
+  return {
+    content: String(data.content || "").trim(),
+    media: Array.isArray(data.media) ? data.media : [],
+  };
+}
+
+async function sendDiscordResponse(channel, response) {
+  if (!channel || !response) {
+    return;
+  }
+  const content = String(response.content || "").trim();
+  const media = Array.isArray(response.media) ? response.media : [];
+  const files = [];
+  for (const item of media) {
+    if (!item || item.type !== "image" || !item.data_b64) {
+      continue;
+    }
+    try {
+      const buffer = Buffer.from(String(item.data_b64), "base64");
+      files.push(new AttachmentBuilder(buffer, { name: String(item.filename || "neuralclaw-image.png") }));
+    } catch (err) {
+      console.warn("[DiscordVoice] failed to decode outbound media:", err.message);
+    }
+  }
+  if (!content && files.length === 0) {
+    return;
+  }
+  if (files.length > 0) {
+    await channel.send({ content: content || undefined, files });
+    return;
+  }
+  await channel.send(content);
 }
 
 async function transcribeWavBytes(wavBuffer) {
@@ -571,10 +602,10 @@ async function processVoiceSegment(session, user, pcmBuffer) {
       discord_control_channel_id: String(session.controlChannelId || ""),
     },
   });
-  if (!response) {
+  if (!response || !response.content) {
     return;
   }
-  await enqueueSpeech(session.guildId, response);
+  await enqueueSpeech(session.guildId, response.content);
 }
 
 function subscribeToUser(session, userId) {
@@ -857,8 +888,8 @@ client.on("messageCreate", async (message) => {
         guild: message.guild?.name || null,
       },
     });
-    if (response) {
-      await message.channel.send(response);
+    if (response && (response.content || (response.media && response.media.length))) {
+      await sendDiscordResponse(message.channel, response);
     }
   } catch (err) {
     console.error("[DiscordVoice] message handling failed:", err);
