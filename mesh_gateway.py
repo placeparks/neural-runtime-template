@@ -97,6 +97,7 @@ _ROLE_HINT_WORDS = {
 }
 _SCREENSHOT_QUERY_RE = re.compile(r"\b(screenshot|screen shot|take a shot of|capture my screen|see my screen|share my screen)\b", re.IGNORECASE)
 _OPEN_LAST_SCREENSHOT_RE = re.compile(r"^\s*open\s+(?:it|the\s+screenshot|screenshot)\b", re.IGNORECASE)
+_DISPLAY_INDEX_RE = re.compile(r"\b(?:display|screen|monitor)\s*(\d+)\b", re.IGNORECASE)
 _REMINDER_RE = re.compile(
     r"^(?:please\s+)?remind\s+me(?:\s+to)?\s+(?P<task>.+?)\s+(?:at|on|in|after|tomorrow|today|every)\s+(?P<when>.+)$",
     re.IGNORECASE,
@@ -117,6 +118,31 @@ def _looks_like_screenshot_request(text: str) -> bool:
 
 def _looks_like_open_last_screenshot_request(text: str) -> bool:
     return bool(_OPEN_LAST_SCREENSHOT_RE.search(_extract_user_message_text(text)))
+
+
+def _extract_screenshot_monitor(text: str) -> int | None:
+    value = _extract_user_message_text(text).lower()
+    if not value:
+        return None
+    if any(token in value for token in ["main display", "main screen", "primary display", "primary screen", "main", "primary"]):
+        return 0
+    match = _DISPLAY_INDEX_RE.search(value)
+    if match:
+        try:
+            display_number = int(match.group(1))
+        except Exception:
+            return None
+        return max(0, display_number - 1)
+    return None
+
+
+def _recent_assistant_message(history: list[dict[str, Any]] | None) -> str:
+    if not history:
+        return ""
+    for item in reversed(history):
+        if str(item.get("role") or "") == "assistant":
+            return str(item.get("content") or "")
+    return ""
 
 
 def _extract_schedule_request(text: str) -> dict[str, str] | None:
@@ -519,6 +545,32 @@ async def _patched_deliberative_reason(
                     confidence=0.2,
                     source="error",
                     uncertainty_factors=["schedule_failed"],
+                    tool_calls_made=1,
+                )
+
+    screenshot_tool = next((t for t in selected_tools if getattr(t, "name", "") == "companion_take_screenshot"), None)
+    if _looks_like_screenshot_request(content_text) and screenshot_tool:
+        monitor = _extract_screenshot_monitor(content_text)
+        forced_capture = await self._execute_tool_call(
+            _ForcedToolCall(getattr(signal, "id", "forced"), "companion_take_screenshot", {"monitor": 0 if monitor is None else monitor}),
+            selected_tools,
+            request_ctx,
+        )
+        if isinstance(forced_capture, dict):
+            if forced_capture.get("ok"):
+                message = str((forced_capture or {}).get("message") or "I've captured your screen and shared the screenshot here.").strip()
+                return ConfidenceEnvelope(
+                    response=message,
+                    confidence=0.97,
+                    source="tool_verified",
+                    tool_calls_made=1,
+                )
+            if forced_capture.get("error"):
+                return ConfidenceEnvelope(
+                    response=f"I couldn't capture a screenshot right now: {str(forced_capture['error']).strip()}",
+                    confidence=0.2,
+                    source="error",
+                    uncertainty_factors=["screenshot_failed"],
                     tool_calls_made=1,
                 )
 
@@ -1333,6 +1385,16 @@ class MeshAwareGateway(NeuralClawGateway):
                     "That screenshot was sent inline here in chat and was not saved as a file on your paired computer, "
                     "so I cannot open it there yet."
                 )
+
+        if not is_cron_run and self._companion_manager and self._companion_manager.enabled:
+            recent_assistant = _recent_assistant_message(getattr(self, "_history", {}).get(channel_id, []))
+            requested_monitor = _extract_screenshot_monitor(content)
+            if requested_monitor is not None and "screenshot" in recent_assistant.lower():
+                captured = await self._companion_manager.take_screenshot(monitor=requested_monitor)
+                if isinstance(captured, dict) and captured.get("ok"):
+                    return str(captured.get("message") or "I've captured your screen and shared the screenshot here.").strip()
+                if isinstance(captured, dict) and captured.get("error"):
+                    return f"I couldn't capture a screenshot right now: {captured['error']}"
 
         resolved_content = content
         if self._is_knowledge_query(content):
