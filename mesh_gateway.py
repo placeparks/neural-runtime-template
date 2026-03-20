@@ -2544,23 +2544,30 @@ class CronJobManager:
         delete_after_run: bool | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
-            return {"ok": False, "error": "scheduler is not enabled"}
+            return {"ok": False, "error": _friendly_schedule_error("scheduler is not enabled")}
 
-        timezone_name = (timezone or self._default_timezone()).strip() or "UTC"
-        self._validate_timezone(timezone_name)
+        try:
+            timezone_name = (timezone or self._default_timezone()).strip() or "UTC"
+            self._validate_timezone(timezone_name)
 
-        normalized_cron = cron_expression.strip()
-        normalized_run_once = run_once_at.strip()
-        parsed: dict[str, Any] = {}
-        if normalized_cron and normalized_run_once:
-            return {"ok": False, "error": "Provide either cron_expression or run_once_at, not both."}
-        if normalized_cron:
-            parsed["cron_expression"] = self._validate_cron_expression(normalized_cron)
-        elif normalized_run_once:
-            parsed["run_once_at"] = self._coerce_run_once_at(normalized_run_once, timezone_name)
-            parsed["delete_after_run"] = True
-        else:
-            parsed = self._parse_schedule_text(schedule_text, timezone_name)
+            normalized_cron = cron_expression.strip()
+            normalized_run_once = run_once_at.strip()
+            parsed: dict[str, Any] = {}
+            if normalized_cron and normalized_run_once:
+                return {"ok": False, "error": _friendly_schedule_error("Provide either cron_expression or run_once_at, not both.")}
+            if normalized_cron:
+                parsed["cron_expression"] = self._validate_cron_expression(normalized_cron)
+            elif normalized_run_once:
+                parsed["run_once_at"] = self._coerce_run_once_at(normalized_run_once, timezone_name)
+                parsed["delete_after_run"] = True
+            else:
+                parsed = self._parse_schedule_text(schedule_text, timezone_name)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "error": _friendly_schedule_error(str(exc)),
+                "follow_up_required": True,
+            }
 
         one_time = bool(parsed.get("run_once_at"))
         delete_flag = bool(delete_after_run) if delete_after_run is not None else bool(parsed.get("delete_after_run") or one_time)
@@ -2588,9 +2595,9 @@ class CronJobManager:
                 ) as resp:
                     data = await resp.json(content_type=None)
                     if resp.status != 200:
-                        return {"ok": False, "error": data.get("error", f"schedule create failed ({resp.status})")}
+                        return {"ok": False, "error": _friendly_schedule_error(data.get("error", f"schedule create failed ({resp.status})"))}
         except Exception as exc:
-            return {"ok": False, "error": f"schedule create failed: {exc}"}
+            return {"ok": False, "error": _friendly_schedule_error(f"schedule create failed: {exc}")}
 
         job = data.get("job") if isinstance(data, dict) else None
         schedule_value = payload.get("runOnceAt") or payload.get("cronExpression")
