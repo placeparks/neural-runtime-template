@@ -2424,6 +2424,15 @@ class CompanionRelayManager:
             try:
                 raw = screenshot_b64.split(",", 1)[1] if screenshot_b64.startswith("data:image/") else screenshot_b64
                 photo_bytes = base64.b64decode(raw)
+                pending_media = getattr(self._gateway, "_pending_media", None)
+                if pending_media is not None:
+                    pending_media[channel_id] = [{
+                        "type": "image",
+                        "data": photo_bytes,
+                        "mime": "image/png",
+                        "width": payload.get("width") or 0,
+                        "height": payload.get("height") or 0,
+                    }]
                 adapter = self._gateway._channels.get(source_channel)
                 if adapter is not None:
                     if source_channel == "telegram" and getattr(adapter, "_app", None) and getattr(adapter._app, "bot", None):
@@ -2444,11 +2453,24 @@ class CompanionRelayManager:
                             )
                     elif hasattr(adapter, "send_photo"):
                         await adapter.send_photo(channel_id, photo_bytes, caption="Here is the screenshot from your computer.")
+                    else:
+                        logger.warning(
+                            "[Companion] screenshot adapter '%s' has no send_photo handler; falling back to pending media",
+                            source_channel,
+                        )
+                        raise RuntimeError(f"adapter '{source_channel}' cannot send photos directly")
+                    if pending_media is not None:
+                        pending_media.pop(channel_id, None)
                     payload.pop("screenshot_b64", None)
                     payload.pop("image_b64", None)
                     result["message"] = "I've captured your screen and shared the screenshot here."
                     result["image_sent"] = True
                     return result
+                logger.warning(
+                    "[Companion] screenshot delivery adapter not found for source_channel=%s channel_id=%s",
+                    source_channel,
+                    channel_id,
+                )
             except Exception as exc:
                 logger.warning("[Companion] screenshot delivery failed: %s", exc)
 
