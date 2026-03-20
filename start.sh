@@ -111,6 +111,10 @@ case "$PROVIDER" in
     PROVIDER="openai"
     OPENAI_BASE_URL="${NEURALCLAW_OPENAI_BASE_URL:-https://api.venice.ai/api/v1}"
     ;;
+  g4f)
+    echo "[runtime] provider 'g4f' is no longer supported by neuralclaw 1.0.1. Use proxy, openrouter, local, or a token-backed provider instead." >&2
+    exit 1
+    ;;
   chatgpt_session) PROVIDER="chatgpt_token" ;;
   claude_session) PROVIDER="claude_token" ;;
 esac
@@ -121,7 +125,6 @@ case "$ORIGINAL_PROVIDER" in
   anthropic) DEFAULT_MODEL="claude-sonnet-4-6" ;;
   openrouter) DEFAULT_MODEL="anthropic/claude-sonnet-4-6" ;;
   local) DEFAULT_MODEL="qwen3:8b" ;;
-  g4f) DEFAULT_MODEL="gpt-5.4" ;;
   chatgpt_token|claude_token) DEFAULT_MODEL="auto" ;;
   proxy) DEFAULT_MODEL="gpt-5.4" ;;
   *) DEFAULT_MODEL="gpt-5.4" ;;
@@ -222,10 +225,6 @@ base_url = "https://openrouter.ai/api/v1"
 [providers.local]
 model = "${MODEL}"
 base_url = "${LOCAL_URL:-http://localhost:11434/v1}"
-
-[providers.g4f]
-model = "${MODEL}"
-base_url = ""
 
 [providers.proxy]
 model = "${MODEL}"

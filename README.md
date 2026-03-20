@@ -9,7 +9,7 @@ This repo is cloned by Railway for each user deployment created by your provisio
 Your provisioner should set these env vars per service:
 
 - `NEURALCLAW_AGENT_NAME`
-- `NEURALCLAW_PROVIDER` (`openai|anthropic|openrouter|venice|local|g4f|chatgpt_token|claude_token`)
+- `NEURALCLAW_PROVIDER` (`openai|anthropic|openrouter|proxy|venice|local|chatgpt_app|claude_app|chatgpt_token|claude_token`)
 - `NEURALCLAW_MODEL`
 - Provider key (one of):
   - `OPENAI_API_KEY`
@@ -42,13 +42,13 @@ Your provisioner should set these env vars per service:
 
 ## Notes
 
-- Uses exact package pin `neuralclaw==0.8.0`.
+- Uses exact package pin `neuralclaw==1.0.1`.
 - Does not run `neuralclaw init` (interactive, not suitable for automation).
 - Stores runtime config in `$HOME/.neuralclaw/config.toml`.
 - Stores persistent runtime state under `/data/neuralclaw` when a Railway volume is mounted, so memory, traces, browser profiles, and sessions survive restarts.
 - Writes mesh peers to `$HOME/.neuralclaw/mesh-peers.json` when provided.
 - Imports `CHATGPT_TOKEN` / `CLAUDE_SESSION_KEY` into NeuralClaw's token store on boot.
 - `CHATGPT_TOKEN` may be either a raw session cookie or a JSON-serialized OAuth credential payload produced by the SaaS auth helper.
-- For ChatGPT and Claude session auth, `0.8.0` supports local bootstrap with `neuralclaw session auth chatgpt --stealth` and `neuralclaw session auth claude --stealth` before pasting the resulting session credential into your SaaS deploy form.
+- For ChatGPT and Claude session auth, `1.0.1` supports local bootstrap with `neuralclaw session auth chatgpt --stealth` and `neuralclaw session auth claude --stealth` before pasting the resulting session credential into your SaaS deploy form.
 - Uses `/app/mesh_gateway.py` to intercept `ask <agent> ...` and delegate over mesh HTTP.
 - Exposes `POST /a2a/message` for remote agents to send tasks.
