@@ -58,6 +58,16 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _extract_user_message_text(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    marker = "USER_MESSAGE:"
+    while marker in value:
+        value = value.split(marker, 1)[1].strip()
+    return value
+
+
 _SEARCH_QUERY_RE = re.compile(
     r"\b(search|find|look up|google|browse|review|reviews|latest|news|reddit|trustpilot)\b",
     re.IGNORECASE,
@@ -97,15 +107,15 @@ _REMINDER_AFTER_RE = re.compile(
 
 
 def _looks_like_web_search_query(text: str) -> bool:
-    return bool(_SEARCH_QUERY_RE.search(text or ""))
+    return bool(_SEARCH_QUERY_RE.search(_extract_user_message_text(text)))
 
 
 def _looks_like_screenshot_request(text: str) -> bool:
-    return bool(_SCREENSHOT_QUERY_RE.search(text or ""))
+    return bool(_SCREENSHOT_QUERY_RE.search(_extract_user_message_text(text)))
 
 
 def _extract_schedule_request(text: str) -> dict[str, str] | None:
-    content = (text or "").strip()
+    content = _extract_user_message_text(text)
     if not content:
         return None
     content = re.sub(
