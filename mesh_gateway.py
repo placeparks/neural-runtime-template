@@ -473,6 +473,16 @@ async def _patched_deliberative_reason(
 
     schedule_payload = _extract_schedule_request(content_text)
     schedule_tool = next((t for t in selected_tools if getattr(t, "name", "") == "create_schedule"), None)
+    if schedule_payload and not schedule_tool:
+        return ConfidenceEnvelope(
+            response=(
+                "I understood the reminder, but the hosted scheduler is not available in this deployment, "
+                "so I did not save any reminder."
+            ),
+            confidence=0.0,
+            source="error",
+            uncertainty_factors=["scheduler_unavailable"],
+        )
     if schedule_payload and schedule_tool:
         forced_schedule = await self._execute_tool_call(
             _ForcedToolCall(getattr(signal, "id", "forced"), "create_schedule", schedule_payload),
