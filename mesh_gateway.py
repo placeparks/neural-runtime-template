@@ -2764,6 +2764,7 @@ class CronJobManager:
                 channel_id=f"cron:{job_id}",
                 channel_type_name="CLI",
                 message_metadata={
+                    "platform": "cli",
                     "source": "cron",
                     "cron_job_id": job_id,
                     "cron_job_name": name,
